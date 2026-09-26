@@ -9,6 +9,7 @@ import {
   CREDENTIAL_ACCOUNT_ISSUER,
   resolveOAuthAccountIssuer,
 } from "./account-issuer";
+import { ownEmailUsername } from "./sign-in-names";
 
 const DEFAULT_SQLITE_URL = "file:./data/caddy-proxy-manager.db";
 
@@ -510,13 +511,13 @@ function runBetterAuthDataMigration() {
     }
   }
 
-  // Populate username field for all users (derived from email prefix)
-  const usersWithoutUsername = db.select().from(users).where(isNull(users.username)).all();
+  // Give users without a username their own email address as one when
+  // ownEmailUsername allows it; the others keep none.
+  const usersWithoutUsername = db.select().from(users).where(isNull(users.username)).orderBy(users.id).all();
   for (const user of usersWithoutUsername) {
-    const usernameFromEmail = user.email.toLowerCase();
     const displayUsername = user.email.split("@")[0] || user.email;
     db.update(users).set({
-      username: usernameFromEmail,
+      username: ownEmailUsername(db, user.id, user.email),
       displayUsername,
     }).where(eq(users.id, user.id)).run();
   }

@@ -26,14 +26,20 @@ export async function register() {
       // Don't throw - let the app start anyway, errors will surface when users try to use features
     }
 
-    // After the environment admin, so its username is taken first.
-    const { repairLoginUsernames } = await import("./lib/models/user");
+    // Only reports: stored usernames are never changed on startup.
+    const { findSignInUsernamesToReview } = await import("./lib/models/user");
     try {
-      for (const { userId, username } of await repairLoginUsernames()) {
-        console.log(`Gave user ${userId} the sign-in username ${username}`);
+      for (const { userId, username, reason } of await findSignInUsernamesToReview()) {
+        console.warn(
+          reason === "shared"
+            ? `Sign-in username ${JSON.stringify(username)} of user ${userId} is also another account's username, ` +
+              "email address or forward-auth portal name; give one of them a different username on the Users page"
+            : `Sign-in username ${JSON.stringify(username)} of user ${userId} is an email address other than the ` +
+              "account's own and can be somebody else's; check it on the Users page"
+        );
       }
     } catch (error) {
-      console.error("Failed to repair sign-in usernames:", error);
+      console.error("Failed to check sign-in usernames:", error);
     }
 
     // Imported keys and provider options could contain plaintext secrets in

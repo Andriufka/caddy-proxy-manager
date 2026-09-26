@@ -1,7 +1,8 @@
 /**
  * The profile page shows the username the login page accepts and, when there
  * is none, why: advice to change the password only where that fixes it, and
- * an explanation where no username can be made from the account's email.
+ * otherwise that an administrator has to set a sign-in username. It never
+ * promises a username made from the email address.
  */
 import { describe, expect, it, vi } from 'vitest';
 import { createElement } from 'react';
@@ -23,7 +24,8 @@ import ProfileClient from '@/app/(dashboard)/profile/ProfileClient';
 type Props = Parameters<typeof ProfileClient>[0];
 
 const CHANGE_ONCE = 'Change it once here to enable password sign-in';
-const NO_USERNAME = 'none could be made from your email address';
+const NO_USERNAME = 'Your account has no sign-in username the login page can use';
+const ADMIN_SETS = 'An administrator has to set a sign-in username for your account';
 const SET_FIRST = 'you must first set a password';
 
 function render(user: Partial<Props['user']>) {
@@ -51,9 +53,9 @@ function render(user: Partial<Props['user']>) {
 
 describe('profile password sign-in', () => {
   it('shows the sign-in username and the unlink button when password sign-in works', () => {
-    const html = render({ signInUsername: 'alice-cpm@example.com' });
+    const html = render({ signInUsername: 'alice' });
     expect(html).toContain('Sign-in username');
-    expect(html).toContain('alice-cpm@example.com');
+    expect(html).toContain('>alice<');
     expect(html).toContain('Unlink OAuth Account');
     expect(html).not.toContain(CHANGE_ONCE);
     expect(html).not.toContain(NO_USERNAME);
@@ -70,12 +72,19 @@ describe('profile password sign-in', () => {
   it('explains a missing username instead of suggesting a password change', () => {
     const html = render({ passwordSignInBlocker: 'no-username' });
     expect(html).toContain(NO_USERNAME);
-    expect(html).toContain('Ask an administrator to change your email address');
-    // The new email gives the password a username; no password change is needed.
-    expect(html).toContain('This page then shows the username to sign in with');
-    expect(html).not.toContain('then set your password here');
+    expect(html).toContain(ADMIN_SETS);
+    expect(html).toContain('This page then shows it.');
+    expect(html).not.toContain('then you can set your password here');
     expect(html).not.toContain(CHANGE_ONCE);
     expect(html).not.toContain('Unlink OAuth Account');
+    expect(html).not.toContain('Sign-in username</p>');
+  });
+
+  it('never says a username is made from the email address', () => {
+    for (const hasPassword of [true, false]) {
+      const html = render({ hasPassword, passwordSignInBlocker: 'no-username' });
+      expect(html).not.toMatch(/made from|could be made|generated|change your email address/i);
+    }
   });
 
   it('asks an OAuth-only user to set a password first', () => {
@@ -86,11 +95,11 @@ describe('profile password sign-in', () => {
     expect(html).not.toContain(NO_USERNAME);
   });
 
-  it('tells an OAuth-only user without a possible username before they set a password', () => {
+  it('tells an OAuth-only user without a usable username before they set a password', () => {
     const html = render({ hasPassword: false, passwordSignInBlocker: 'no-username' });
     expect(html).toContain(NO_USERNAME);
-    expect(html).toContain('then set your password here');
-    expect(html).not.toContain('This page then shows the username');
+    expect(html).toContain(`${ADMIN_SETS}, then you can set your password here`);
+    expect(html).not.toContain('This page then shows it');
     expect(html).not.toContain('You are using OAuth-only authentication');
   });
 });

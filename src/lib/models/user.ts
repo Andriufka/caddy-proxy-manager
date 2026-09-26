@@ -23,20 +23,34 @@ import {
   forwardAuthExchanges,
 } from "../db/schema";
 import * as schema from "../db/schema";
-import { and, count, desc, eq, inArray, is, isNotNull, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, count, desc, eq, inArray, is, isNotNull, ne, notInArray, sql } from "drizzle-orm";
 import { SQLiteTable, getTableConfig } from "drizzle-orm/sqlite-core";
 import { deleteUserForwardAuthSessions } from "./forward-auth";
 import {
   CREDENTIAL_ACCOUNT_ISSUER,
   resolveOAuthAccountIssuer,
 } from "../account-issuer";
-import { isUsableSignInUsername, loginUsernameCandidates } from "../login-username";
+import { SIGN_IN_USERNAME_RULES_MESSAGE, isUsableSignInUsername } from "../login-username";
+import {
+  PORTAL_EMAIL_DOMAIN,
+  SIGN_IN_NAME_TAKEN_MESSAGE,
+  isSignInNameTaken,
+  lowercasesIntoAscii,
+  ownEmailUsername,
+  signInEmailConflict,
+  type SignInNameReader,
+} from "../sign-in-names";
+import { ApiValidationError } from "../api-errors";
 
 export type User = {
   id: number;
   email: string;
   name: string | null;
-  /** What the user types as username on the login page (see loginUsernameCandidates). */
+  /**
+   * The username stored for the login page, or null. CPM only ever stores the
+   * account's own email (see ownEmailUsername) or one an administrator chose
+   * (updateUserAccount).
+   */
   username: string | null;
   passwordHash: string | null;
   role: "admin" | "user" | "viewer";
@@ -118,13 +132,24 @@ export async function createUser(data: {
 }): Promise<User> {
   const now = nowIso();
   const role = data.role ?? "user";
+  // The address is stored lowercased, so lowercasing must not turn it into another one.
+  if (lowercasesIntoAscii(data.email)) {
+    throw new ApiValidationError(
+      "Email address contains a character that lowercasing turns into an ASCII letter (such as the Kelvin sign); " +
+      "enter it with plain letters"
+    );
+  }
   const email = data.email.trim().toLowerCase();
   const provider = data.provider === "credential" ? "credentials" : data.provider;
 
-  // One synchronous transaction, so no other account can take the username
-  // between picking it and inserting the user.
+  // One synchronous transaction, so no other account can take the email
+  // address or the username between checking it and inserting the user.
   const user = db.transaction((tx) => {
-    const username = data.username ?? allocateLoginUsername(tx, null, email);
+    const emailConflict = signInEmailConflict(tx, null, email);
+    if (emailConflict) throw new ApiValidationError(emailConflict);
+    const username = data.username != null
+      ? checkChosenUsername(tx, null, data.username)
+      : ownEmailUsername(tx, null, email);
     const displayUsername = data.displayUsername ?? data.name ?? email.split("@")[0];
     const row = tx
       .insert(users)
@@ -162,95 +187,181 @@ export async function createUser(data: {
   return parseDbUser(user);
 }
 
-/**
- * Updates the email, name and avatar. A user with a password the login page
- * cannot find them by (see signInNameRepair) is given a username made from
- * the resulting email, so an administrator editing the account, or changing
- * an email no username could be made from, lets them sign in again.
- */
-export async function updateUserProfile(userId: number, data: { email?: string; name?: string | null; avatarUrl?: string | null }): Promise<User | null> {
-  const now = nowIso();
-  const updated = db.transaction((tx) => {
-    const current = tx.select().from(users).where(eq(users.id, userId)).get();
-    if (!current) return null;
-    const email = data.email ?? current.email;
-    const name = data.name ?? current.name;
-    return tx
-      .update(users)
-      .set({
-        email,
-        name,
-        avatarUrl: data.avatarUrl ?? current.avatarUrl,
-        ...signInNameRepair(tx, { ...current, email, name }),
-        updatedAt: now
-      })
-      .where(eq(users.id, userId))
-      .returning()
-      .get();
-  });
-
-  return updated ? parseDbUser(updated) : null;
-}
-
 type DbTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
-type DbReader = Pick<DbTransaction, "select">;
-
-/** Whether the user has a password on the credential account, the one the login page checks. */
-function hasCredentialPassword(reader: DbReader, userId: number): boolean {
-  return !!reader
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(
-      eq(accounts.userId, userId),
-      eq(accounts.providerId, "credential"),
-      isNotNull(accounts.password),
-      ne(accounts.password, "")
-    ))
-    .get();
-}
-
-type SignInNameSource = Pick<DbUser, "id" | "email" | "name" | "username" | "displayUsername">;
-type SignInName = { username: string; displayUsername: string };
-
-/** The columns that give `user` the username allocateLoginUsername picks. */
-function allocateSignInName(reader: DbReader, user: SignInNameSource): SignInName | null {
-  const username = allocateLoginUsername(reader, user.id, user.email);
-  return username
-    ? { username, displayUsername: user.displayUsername ?? user.name ?? username.split("@")[0] }
-    : null;
-}
 
 /**
- * The columns that give a user who has a password on the credential account,
- * but a username the login page cannot find them by, a usable one made from
- * their email; null when neither applies or every candidate is taken. Such a
- * username has never worked for signing in, so replacing it breaks nothing.
+ * A username an administrator chose that the account cannot have. The message
+ * says why and is safe to show; the REST API answers it with 400.
  */
-function signInNameRepair(reader: DbReader, user: SignInNameSource): SignInName | null {
-  if (isUsableSignInUsername(user.username) || !hasCredentialPassword(reader, user.id)) return null;
-  return allocateSignInName(reader, user);
-}
-
-/**
- * The first of loginUsernameCandidates(email) that no other account signs in
- * with or has as its email address, or null when all are taken. The login
- * page lowercases what is typed, so names are compared case-insensitively.
- * `userId` is the account being given the name (null for one not created
- * yet); its own username and email do not count as taken.
- */
-function allocateLoginUsername(reader: DbReader, userId: number | null, email: string): string | null {
-  for (const candidate of loginUsernameCandidates(email)) {
-    const holder = reader
-      .select({ id: users.id })
-      .from(users)
-      .where(and(
-        or(sql`lower(${users.username}) = ${candidate}`, sql`lower(${users.email}) = ${candidate}`),
-        userId === null ? undefined : ne(users.id, userId)
-      ))
-      .get();
-    if (!holder) return candidate;
+export class SignInUsernameError extends ApiValidationError {
+  constructor(message: string) {
+    super(message);
+    this.name = "SignInUsernameError";
   }
-  return null;
+}
+
+/**
+ * A username an administrator chose for account `userId` (null for one not
+ * created yet), trimmed. Throws SignInUsernameError unless the login page can
+ * find it and no other account has it (see isSignInNameTaken).
+ */
+function checkChosenUsername(reader: SignInNameReader, userId: number | null, input: string): string {
+  const username = input.trim();
+  if (!isUsableSignInUsername(username)) {
+    throw new SignInUsernameError(SIGN_IN_USERNAME_RULES_MESSAGE);
+  }
+  if (isSignInNameTaken(reader, userId, username)) {
+    throw new SignInUsernameError(SIGN_IN_NAME_TAKEN_MESSAGE);
+  }
+  return username;
+}
+
+type ProfileChanges = { email?: string; name?: string | null; avatarUrl?: string | null };
+
+/**
+ * Applies `data` to user `userId` inside `tx`, or returns null when there is
+ * no such user. A new email address (not only a new case of the current one)
+ * must pass signInEmailConflict, and a username (`data.username`) other than
+ * the one the user has must pass checkChosenUsername; otherwise the reason is
+ * thrown and nothing is written. Returns the row and the previous username.
+ */
+function writeUserChanges(
+  tx: DbTransaction,
+  userId: number,
+  data: ProfileChanges & { username?: string },
+  now: string
+): { row: DbUser; previousUsername: string | null } | null {
+  const current = tx.select().from(users).where(eq(users.id, userId)).get();
+  if (!current) return null;
+  if (data.email !== undefined && data.email.toLowerCase() !== current.email.toLowerCase()) {
+    const conflict = signInEmailConflict(tx, userId, data.email);
+    if (conflict) throw new ApiValidationError(conflict);
+  }
+  // The username the user has is no change, so the other fields can be edited
+  // while it is one the login page cannot use.
+  const username = data.username !== undefined && data.username.trim() !== (current.username ?? "")
+    ? checkChosenUsername(tx, userId, data.username)
+    : null;
+  const row = tx
+    .update(users)
+    .set({
+      email: data.email ?? current.email,
+      name: data.name ?? current.name,
+      avatarUrl: data.avatarUrl ?? current.avatarUrl,
+      // displayUsername follows, as Better Auth stores it when a username changes.
+      ...(username === null ? {} : { username, displayUsername: username }),
+      updatedAt: now
+    })
+    .where(eq(users.id, userId))
+    .returning()
+    .get();
+  return { row, previousUsername: current.username };
+}
+
+/**
+ * Updates the email, name and avatar. The username is left as it is, whatever
+ * the new email: only an administrator changes it (updateUserAccount). A new
+ * email address that another account has, or signs in with, is refused with
+ * the reason (see signInEmailConflict).
+ */
+export async function updateUserProfile(userId: number, data: ProfileChanges): Promise<User | null> {
+  const now = nowIso();
+  const profile: ProfileChanges = { email: data.email, name: data.name, avatarUrl: data.avatarUrl };
+  const result = db.transaction((tx) => writeUserChanges(tx, userId, profile, now));
+  return result ? parseDbUser(result.row) : null;
+}
+
+/**
+ * An administrator's edit of a user: the profile fields as updateUserProfile
+ * applies them and the username the user signs in with on the login page (see
+ * checkChosenUsername; setting the one the user has changes nothing). One
+ * transaction, so a refused value leaves every field unchanged. Returns the
+ * user and the username they had before, or null when there is no such user.
+ */
+export async function updateUserAccount(
+  userId: number,
+  data: ProfileChanges & { username?: string }
+): Promise<{ user: User; previousUsername: string | null } | null> {
+  const now = nowIso();
+  const result = db.transaction((tx) => writeUserChanges(tx, userId, data, now));
+  return result ? { user: parseDbUser(result.row), previousUsername: result.previousUsername } : null;
+}
+
+/** updateUserAccount with only a username. */
+export async function setUserSignInUsername(
+  userId: number,
+  input: string
+): Promise<{ user: User; previousUsername: string | null } | null> {
+  return updateUserAccount(userId, { username: input });
+}
+
+/**
+ * Applies CPM's sign-in name rules to a user Better Auth is about to create,
+ * as its database hook receives it (with the email lowercased). An email
+ * address another account has, or signs in with, is refused with the reason
+ * (see signInEmailConflict). A self-registered account gets its own email as
+ * username when ownEmailUsername allows it, and none otherwise, whatever the
+ * request asked for: CPM stores no other username than that or one an
+ * administrator sets. Any other account (an OAuth sign-up) gets none until its
+ * password is set (see writeUserPassword).
+ */
+export function applySignInNameRules<T extends Record<string, unknown>>(
+  user: T,
+  selfRegistered: boolean
+): T & { username: string | null } {
+  const email = typeof user.email === "string" ? user.email : "";
+  const conflict = signInEmailConflict(db, null, email);
+  if (conflict) throw new ApiValidationError(conflict);
+  if (!selfRegistered) return { ...user, username: null };
+  const username = ownEmailUsername(db, null, email);
+  return { ...user, username, displayUsername: username };
+}
+
+export type SignInUsernameReview = { userId: number; username: string; reason: "shared" | "other-address" };
+
+/**
+ * Stored usernames for an administrator to check. It only reads, so it suits
+ * startup:
+ *  - "shared": another account has the name as username or email address, or
+ *    as its forward-auth portal name, so the name can reach either account;
+ *  - "other-address": the name is an email address other than the account's
+ *    own, such as alice-cpm@example.com on the account alice+cpm@example.com
+ *    or the account's address before it changed, which can be somebody else's.
+ */
+export async function findSignInUsernamesToReview(): Promise<SignInUsernameReview[]> {
+  const rows = await db
+    .select({ id: users.id, email: users.email, username: users.username })
+    .from(users)
+    .orderBy(users.id)
+    .all();
+  const holders = new Map<string, Set<number>>();
+  const hold = (name: string, userId: number) => {
+    const ids = holders.get(name) ?? new Set<number>();
+    ids.add(userId);
+    holders.set(name, ids);
+  };
+  for (const row of rows) {
+    const email = row.email.toLowerCase();
+    hold(email, row.id);
+    if (email.endsWith(PORTAL_EMAIL_DOMAIN)) hold(email.slice(0, -PORTAL_EMAIL_DOMAIN.length), row.id);
+    if (row.username) hold(row.username.toLowerCase(), row.id);
+  }
+
+  const review: SignInUsernameReview[] = [];
+  for (const row of rows) {
+    if (!row.username) continue;
+    const name = row.username.toLowerCase();
+    if ([...holders.get(name)!].some((id) => id !== row.id)) {
+      review.push({ userId: row.id, username: row.username, reason: "shared" });
+    } else if (
+      name.includes("@") &&
+      name !== row.email.toLowerCase() &&
+      name + PORTAL_EMAIL_DOMAIN !== row.email.toLowerCase()
+    ) {
+      review.push({ userId: row.id, username: row.username, reason: "other-address" });
+    }
+  }
+  return review;
 }
 
 /**
@@ -258,16 +369,16 @@ function allocateLoginUsername(reader: DbReader, userId: number | null, email: s
  * account, which is what the login page checks. An account without a password
  * (OAuth-only) has no credential account yet, so one is created.
  *
- * The login page signs in by username. A user without one it can find (users
- * provisioned by an OAuth sign-in have none; older accounts can hold an email
- * it refuses, such as one with a '+') is given one made from their email by
- * allocateLoginUsername; a usable username is kept. The SQLite driver is
- * synchronous, so this runs inside a synchronous transaction.
+ * The login page signs in by username. A usable username is kept. A user
+ * without one (users provisioned by an OAuth sign-in have none; older accounts
+ * can hold one the login page refuses, such as an email with a '+') gets their
+ * own email when ownEmailUsername allows it and otherwise keeps what they
+ * have. The SQLite driver is synchronous, so this runs inside a synchronous
+ * transaction.
  */
 function writeUserPassword(tx: DbTransaction, userId: number, passwordHash: string, now: string): void {
   const user = tx
     .select({
-      id: users.id,
       email: users.email,
       name: users.name,
       username: users.username,
@@ -276,7 +387,10 @@ function writeUserPassword(tx: DbTransaction, userId: number, passwordHash: stri
     .from(users)
     .where(eq(users.id, userId))
     .get();
-  const signInName = user && !isUsableSignInUsername(user.username) ? allocateSignInName(tx, user) : null;
+  const username = user && !isUsableSignInUsername(user.username) ? ownEmailUsername(tx, userId, user.email) : null;
+  const signInName = user && username
+    ? { username, displayUsername: user.displayUsername ?? user.name ?? username.split("@")[0] }
+    : null;
 
   tx.update(users)
     .set({ passwordHash, ...signInName, updatedAt: now })
@@ -302,41 +416,6 @@ function writeUserPassword(tx: DbTransaction, userId: number, passwordHash: stri
       })
       .run();
   }
-}
-
-/**
- * Gives every user who has a password on the credential account, but a
- * username the login page cannot find them by, one made from their email
- * (see signInNameRepair). Older releases stored the email as it was, such as
- * alice+cpm@example.com, which the login page refuses; users without OAuth
- * could then not sign in to change anything. It needs nobody to sign in, so
- * it suits startup. Returns the usernames it gave out; accounts whose
- * candidates are all taken are skipped.
- */
-export async function repairLoginUsernames(): Promise<Array<{ userId: number; username: string }>> {
-  const now = nowIso();
-  return db.transaction((tx) => {
-    const unusable = tx
-      .select({
-        id: users.id,
-        email: users.email,
-        name: users.name,
-        username: users.username,
-        displayUsername: users.displayUsername,
-      })
-      .from(users)
-      .orderBy(users.id)
-      .all()
-      .filter((user) => !isUsableSignInUsername(user.username));
-    const repaired: Array<{ userId: number; username: string }> = [];
-    for (const user of unusable) {
-      const signInName = signInNameRepair(tx, user);
-      if (!signInName) continue;
-      tx.update(users).set({ ...signInName, updatedAt: now }).where(eq(users.id, user.id)).run();
-      repaired.push({ userId: user.id, username: signInName.username });
-    }
-    return repaired;
-  });
 }
 
 /**
@@ -411,10 +490,11 @@ export async function getPasswordSignInUsername(userId: number): Promise<string 
  * Why the login page cannot sign a user in with a password:
  *  - "no-credential": it has no username and password pair for them yet. The
  *    password is not on the credential account, or the account has no usable
- *    username; setting or changing the password sets up both.
- *  - "no-username": no usable username can be made from the account's email
- *    (see allocateLoginUsername), so no password change helps. Changing the
- *    email (updateUserProfile) gives a user with a password one right away.
+ *    username but can have its own email as one (see ownEmailUsername);
+ *    setting or changing the password sets up both.
+ *  - "no-username": the account has no usable username and cannot have its
+ *    own email as one, so no password change helps. An administrator has to
+ *    set one (setUserSignInUsername).
  */
 export type PasswordSignInBlocker = "no-credential" | "no-username";
 
@@ -432,7 +512,7 @@ export async function getPasswordSignInStatus(userId: number): Promise<PasswordS
     .where(eq(users.id, userId))
     .get();
   const canGetUsername = !!user &&
-    (isUsableSignInUsername(user.username) || allocateLoginUsername(db, userId, user.email) !== null);
+    (isUsableSignInUsername(user.username) || ownEmailUsername(db, userId, user.email) !== null);
   return { username: null, blocker: canGetUsername ? "no-credential" : "no-username" };
 }
 

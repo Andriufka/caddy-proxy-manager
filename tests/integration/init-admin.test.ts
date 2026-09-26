@@ -221,6 +221,69 @@ describe('ensureAdminUser', { timeout: 20_000 }, () => {
     expect(JSON.stringify(marker)).not.toContain('Env-Password-2026!');
   });
 
+  describe('an ADMIN_USERNAME another account already signs in with', () => {
+    async function seedOtherUser(email: string, username: string | null) {
+      const now = new Date().toISOString();
+      const [row] = await ctx.db.insert(schema.users).values({
+        email, username, displayUsername: username, name: null, role: 'user', provider: 'credentials',
+        subject: email, status: 'active', createdAt: now, updatedAt: now,
+      }).returning();
+      return row.id;
+    }
+
+    it.each([
+      ['root', 'ops@example.com'],
+      ['root@localhost', 'ops@example.com'],
+      [null, 'root'],
+      [null, 'root@localhost'],
+      [null, 'Root@LOCALHOST'],
+    ])('is not applied while another account has username %j or email %j', async (username, email) => {
+      await ensureAdminUser();
+      const otherId = await seedOtherUser(email, username);
+      const before = await adminRow();
+      const marker = await storedMarker();
+
+      ctx.config.adminUsername = 'Root';
+      ctx.config.adminPassword = 'Recovery-Password-2026!';
+      await expect(ensureAdminUser()).rejects.toThrow(/ADMIN_USERNAME "Root" is not applied/);
+
+      // Nothing is written, so the next start tries again.
+      expect(await adminRow()).toEqual(before);
+      expect(await storedMarker()).toEqual(marker);
+      const other = await ctx.db.select().from(schema.users).where(eq(schema.users.id, otherId)).get();
+      expect(other).toMatchObject({ email, username });
+    });
+
+    it('is not applied on the first start without a marker either', async () => {
+      await ensureAdminUser();
+      await forgetMarker();
+      await setAdminPassword('Changed-In-Ui-2026!');
+      await seedOtherUser('ops@example.com', 'root');
+
+      ctx.config.adminUsername = 'root';
+      await expect(ensureAdminUser()).rejects.toThrow(/is not applied/);
+      expect((await adminRow()).username).toBe('admin');
+    });
+
+    it('does not create the primary admin with it', async () => {
+      await seedOtherUser('ops@example.com', 'admin');
+
+      await expect(ensureAdminUser()).rejects.toThrow(/ADMIN_USERNAME "admin" is not applied/);
+      expect(await ctx.db.select().from(schema.users).where(eq(schema.users.id, 1)).get()).toBeUndefined();
+    });
+
+    it('still applies other environment changes when the admin keeps its username', async () => {
+      await ensureAdminUser();
+      // An older duplicate is left for an administrator to resolve.
+      await seedOtherUser('ops@example.com', 'admin');
+
+      ctx.config.adminPassword = 'Recovery-Password-2026!';
+      await ensureAdminUser();
+
+      expect(bcrypt.compareSync('Recovery-Password-2026!', await adminHash())).toBe(true);
+    });
+  });
+
   describe('first start without a marker (upgrade)', () => {
     it('keeps a password that no longer matches the environment, and says so', async () => {
       await ensureAdminUser();

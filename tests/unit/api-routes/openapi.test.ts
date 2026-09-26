@@ -151,4 +151,27 @@ describe('GET /api/v1/openapi.json', () => {
     expect(getSettingsSchemas).not.toContainEqual({ $ref: '#/components/schemas/CloudflareSettings' });
     expect(putSettingsSchemas).toContainEqual({ $ref: '#/components/schemas/CloudflareSettings' });
   });
+
+  it('documents the sign-in username administrators set when creating and updating users', async () => {
+    const response = await GET(makeRequest());
+    const data = await response.json();
+    const users = data.paths['/api/v1/users'];
+    const user = data.paths['/api/v1/users/{id}'];
+
+    expect(users.post.operationId).toBe('createUser');
+    expect(users.post.requestBody.content['application/json'].schema.required).toEqual(['email', 'password']);
+    for (const operation of [users.post, user.put]) {
+      const username = operation.requestBody.content['application/json'].schema.properties.username;
+      expect(username.type).toBe('string');
+      expect(username.description).toContain('3-255');
+      expect(username.description).toContain('portal name');
+      expect(username.description).toContain('400');
+      const email = operation.requestBody.content['application/json'].schema.properties.email;
+      expect(email.description).toMatch(/400 when another account has it .* or signs in with it as username/);
+    }
+    const stored = data.components.schemas.User.properties.username;
+    expect(stored.type).toEqual(['string', 'null']);
+    expect(stored.description).toContain('own email address');
+    expect(stored.description).not.toMatch(/made from|derived|-2@/);
+  });
 });

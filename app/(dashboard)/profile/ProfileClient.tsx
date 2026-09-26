@@ -85,12 +85,11 @@ interface UserData {
 function passwordSignInProblem(user: UserData): string | null {
   if (user.signInUsername) return null;
   if (user.passwordSignInBlocker === "no-username") {
-    const prefix = "Your account has no username the sign-in page accepts, and none could be made from your email address, " +
-      "so a password cannot be used to sign in. Ask an administrator to change your email address";
-    // A password on the account gets its username with the new email; without one, setting it does.
+    const prefix = "Your account has no sign-in username the login page can use, so you cannot sign in there with a password. " +
+      "An administrator has to set a sign-in username for your account";
     return user.hasPassword
-      ? `${prefix}. This page then shows the username to sign in with.`
-      : `${prefix}, then set your password here.`;
+      ? `${prefix}. This page then shows it.`
+      : `${prefix}, then you can set your password here.`;
   }
   if (user.hasPassword) {
     return "Your password cannot be used on the sign-in page yet. Change it once here to enable password sign-in.";

@@ -4,13 +4,14 @@ import { revalidatePath } from "next/cache";
 import { requireAdmin } from "@/src/lib/auth";
 import {
   createUser,
-  updateUserProfile,
+  updateUserAccount,
   updateUserRole,
   updateUserStatus,
   deleteUser,
   type User,
 } from "@/src/lib/models/user";
 import { logAuditEvent } from "@/src/lib/audit";
+import { ApiClientError } from "@/src/lib/api-errors";
 import { passwordPolicyMessage } from "@/src/lib/password-policy";
 
 const VALID_ROLES = new Set<User["role"]>(["admin", "user", "viewer"]);
@@ -38,11 +39,15 @@ function isUniqueViolation(error: unknown): boolean {
 }
 
 /**
- * Maps a storage error to a message for the admin. Anything unexpected is
+ * Maps an error from the model to a message for the admin. A refused value
+ * (ApiClientError) carries a message meant to be shown. Anything unexpected is
  * logged and reported generically: driver messages can carry query text and
  * parameters.
  */
 function storageFailure(error: unknown, action: string): UserActionResult {
+  if (error instanceof ApiClientError) {
+    return failure(error.message);
+  }
   if (isUniqueViolation(error)) {
     return failure("A user with this email already exists");
   }
@@ -156,17 +161,28 @@ export async function updateUserStatusAction(userId: number, status: string): Pr
   return { ok: true };
 }
 
+/**
+ * Saves the edit dialog: name, email and the username the user signs in with
+ * on the login page, in one transaction (see updateUserAccount), so a refused
+ * username or email address leaves every field as it was and the reason comes
+ * back as the error. A form without a username field leaves it alone.
+ */
 export async function updateUserInfoAction(userId: number, formData: FormData): Promise<UserActionResult> {
   const session = await requireAdmin();
   const actorId = Number(session.user.id);
 
   const name = formData.get("name") ? String(formData.get("name")).trim() : undefined;
   const email = formData.get("email") ? String(formData.get("email")).trim() : undefined;
+  const username = formData.has("username") ? String(formData.get("username")) : undefined;
 
+  let changed: Awaited<ReturnType<typeof updateUserAccount>>;
   try {
-    await updateUserProfile(userId, { name, email });
+    changed = await updateUserAccount(userId, { name, email, username });
   } catch (error) {
     return storageFailure(error, "update user");
+  }
+  if (!changed) {
+    return failure("User not found");
   }
 
   logAuditEvent({
@@ -176,6 +192,16 @@ export async function updateUserInfoAction(userId: number, formData: FormData): 
     entityId: userId,
     summary: `Updated user ${userId} profile`,
   });
+  if (changed.user.username !== changed.previousUsername) {
+    logAuditEvent({
+      userId: actorId,
+      action: "update",
+      entityType: "user",
+      entityId: userId,
+      summary: `Changed user ${userId} sign-in username to ${changed.user.username}`,
+      data: { previousUsername: changed.previousUsername, username: changed.user.username },
+    });
+  }
 
   revalidatePath("/users");
   return { ok: true };

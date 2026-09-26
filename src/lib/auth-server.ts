@@ -14,6 +14,7 @@ import {
 } from "./account-issuer";
 import { MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH, passwordPolicyMessage } from "./password-policy";
 import { LOGIN_USERNAME_MAX_LENGTH, LOGIN_USERNAME_MIN_LENGTH, isValidLoginUsername } from "./login-username";
+import { ApiClientError } from "./api-errors";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let cachedAuth: any = null;
@@ -137,16 +138,35 @@ const PASSWORD_SETTING_FIELDS = new Map<string, string>([
 ]);
 
 /** Applies CPM's password policy to the Better Auth endpoints above. */
-const enforcePasswordPolicy = createAuthMiddleware(async (ctx) => {
-  const field = PASSWORD_SETTING_FIELDS.get(ctx.path);
+function enforcePasswordPolicy(path: string, body: Record<string, unknown> | undefined): void {
+  const field = PASSWORD_SETTING_FIELDS.get(path);
   if (!field) return;
-  const password = (ctx.body as Record<string, unknown> | undefined)?.[field];
+  const password = body?.[field];
   // A missing or non-string value is rejected by the endpoint's own validation.
   if (typeof password !== "string") return;
   const policyError = passwordPolicyMessage(password);
   if (policyError) {
     throw new APIError("BAD_REQUEST", { message: policyError });
   }
+}
+
+/**
+ * Self-registration cannot choose a username: the account gets its own email
+ * address as one (see applySignInNameRules). Removing the requested one
+ * before the username plugin's hooks run also keeps the plugin from copying
+ * displayUsername into it and from answering whether a name is taken.
+ */
+function dropRequestedUsername(path: string, body: Record<string, unknown> | undefined): void {
+  if (path !== "/sign-up/email" || !body) return;
+  delete body.username;
+  delete body.displayUsername;
+}
+
+/** CPM's checks on Better Auth requests; they run before the plugins' hooks. */
+const beforeRequest = createAuthMiddleware(async (ctx) => {
+  const body = ctx.body !== null && typeof ctx.body === "object" ? ctx.body as Record<string, unknown> : undefined;
+  enforcePasswordPolicy(ctx.path, body);
+  dropRequestedUsername(ctx.path, body);
 });
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -237,20 +257,37 @@ function createAuth(): any {
       },
     },
     hooks: {
-      before: enforcePasswordPolicy,
+      before: beforeRequest,
     },
     databaseHooks: {
       user: {
         create: {
-          // By default, never let an external IdP set privileged fields
-          // (role/status) on a newly federated user — see enforceSafeUserDefaults
-          // above. Operators who trust their IdP to manage roles can opt out
-          // with AUTH_ALLOW_OAUTH_ROLE_FROM_CLAIMS=true.
-          before: async (user: Record<string, unknown>) => {
-            if (config.auth.allowOauthRoleFromClaims) {
-              return { data: user };
+          before: async (user: Record<string, unknown>, context?: { path?: string } | null) => {
+            // Self-registration and OAuth sign-ups follow CPM's sign-in name
+            // rules: the email address must not be another account's sign-in
+            // name, and a self-registered account can only get its own email
+            // as username (see applySignInNameRules).
+            const { applySignInNameRules } = await import("./models/user");
+            const selfRegistered = context?.path === "/sign-up/email";
+            let named: Record<string, unknown>;
+            try {
+              named = applySignInNameRules(user, selfRegistered);
+            } catch (error) {
+              // Self-registration answers with the reason; an OAuth sign-up
+              // fails as Better Auth's "unable to create user".
+              if (selfRegistered && error instanceof ApiClientError) {
+                throw new APIError("BAD_REQUEST", { message: error.message });
+              }
+              throw error;
             }
-            return { data: enforceSafeUserDefaults(user) };
+            // By default, never let an external IdP set privileged fields
+            // (role/status) on a newly federated user — see enforceSafeUserDefaults
+            // above. Operators who trust their IdP to manage roles can opt out
+            // with AUTH_ALLOW_OAUTH_ROLE_FROM_CLAIMS=true.
+            if (config.auth.allowOauthRoleFromClaims) {
+              return { data: named };
+            }
+            return { data: enforceSafeUserDefaults(named) };
           },
         },
       },

@@ -8,7 +8,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   requireAdmin: vi.fn(),
   createUser: vi.fn(),
-  updateUserProfile: vi.fn(),
+  updateUserAccount: vi.fn(),
   updateUserRole: vi.fn(),
   updateUserStatus: vi.fn(),
   deleteUser: vi.fn(),
@@ -18,7 +18,7 @@ vi.mock('next/cache', () => ({ revalidatePath: vi.fn() }));
 vi.mock('@/src/lib/auth', () => ({ requireAdmin: mocks.requireAdmin }));
 vi.mock('@/src/lib/models/user', () => ({
   createUser: mocks.createUser,
-  updateUserProfile: mocks.updateUserProfile,
+  updateUserAccount: mocks.updateUserAccount,
   updateUserRole: mocks.updateUserRole,
   updateUserStatus: mocks.updateUserStatus,
   deleteUser: mocks.deleteUser,
@@ -31,6 +31,7 @@ import {
   updateUserRoleAction,
   updateUserStatusAction,
 } from '@/app/(dashboard)/users/actions';
+import { ApiValidationError } from '@/src/lib/api-errors';
 
 beforeEach(() => {
   for (const fn of Object.values(mocks)) fn.mockReset();
@@ -96,9 +97,41 @@ describe('users actions', () => {
     const created = await createUserAction(form({ email: 'bob@example.com', password: 'Correct-Horse-9!' }));
     expect(created).toEqual({ ok: false, error: 'A user with this email already exists' });
 
-    mocks.updateUserProfile.mockRejectedValue(uniqueViolation());
+    mocks.updateUserAccount.mockRejectedValue(uniqueViolation());
     const updated = await updateUserInfoAction(2, form({ email: 'bob@example.com' }));
     expect(updated).toEqual({ ok: false, error: 'A user with this email already exists' });
+  });
+
+  it('returns the reason the model refuses a value', async () => {
+    const refusal = new ApiValidationError('Another account signs in with this email address as its username');
+    mocks.createUser.mockRejectedValue(refusal);
+    mocks.updateUserAccount.mockRejectedValue(refusal);
+
+    const created = await createUserAction(form({ email: 'bob@example.com', password: 'Correct-Horse-9!' }));
+    const updated = await updateUserInfoAction(2, form({ email: 'bob@example.com' }));
+
+    expect(created).toEqual({ ok: false, error: refusal.message });
+    expect(updated).toEqual({ ok: false, error: refusal.message });
+  });
+
+  it('saves name, email and username in one model call', async () => {
+    mocks.updateUserAccount.mockResolvedValue({ user: { id: 2, username: 'bob' }, previousUsername: 'bob' });
+    const result = await updateUserInfoAction(2, form({ name: 'Bob', email: 'bob@example.com', username: 'bob' }));
+    expect(result).toEqual({ ok: true });
+    expect(mocks.updateUserAccount).toHaveBeenCalledTimes(1);
+    expect(mocks.updateUserAccount).toHaveBeenCalledWith(2, { name: 'Bob', email: 'bob@example.com', username: 'bob' });
+  });
+
+  it('leaves the username alone when the form has no username field', async () => {
+    mocks.updateUserAccount.mockResolvedValue({ user: { id: 2, username: null }, previousUsername: null });
+    expect(await updateUserInfoAction(2, form({ name: 'Bob' }))).toEqual({ ok: true });
+    expect(mocks.updateUserAccount).toHaveBeenCalledWith(2, { name: 'Bob', email: undefined, username: undefined });
+  });
+
+  it('does not save anything for a caller who is not an administrator', async () => {
+    mocks.requireAdmin.mockRejectedValue(new Error('NEXT_REDIRECT'));
+    await expect(updateUserInfoAction(2, form({ username: 'alice' }))).rejects.toThrow('NEXT_REDIRECT');
+    expect(mocks.updateUserAccount).not.toHaveBeenCalled();
   });
 
   it('reports other storage failures generically', async () => {

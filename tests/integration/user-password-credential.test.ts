@@ -4,14 +4,19 @@
  *
  *  - setting a password keeps users.passwordHash and the Better Auth
  *    credential account in step, creating the credential account for an
- *    OAuth-only user (the login page checks only that account) and giving a
- *    user without a usable username one made from their email (the login
- *    page signs in by username): the email itself, the email with refused
- *    characters replaced, or a numbered variant when that is taken;
- *  - createUser picks the account's username the same way and returns it;
- *  - a user with a password but a username the login page cannot find them
- *    by is given one when their profile is updated and by the startup
- *    repair, without having to sign in first;
+ *    OAuth-only user (the login page checks only that account);
+ *  - the only username CPM gives an account by itself is the account's own
+ *    email, lowercased, when the login page accepts it and no other account
+ *    has it as username or email. Nothing is made up from an email: no
+ *    replaced characters, no numbered variants; otherwise the username stays
+ *    empty (or as it was) and the profile page reports "no-username";
+ *  - createUser applies the same rule and checks an explicit username, and
+ *    refuses an email address another account has or signs in with, or one
+ *    that lowercasing turns into another address;
+ *  - profile edits never change a username and refuse such an email address;
+ *    administrators set a username with setUserSignInUsername, which must not
+ *    be another account's username, email address or forward-auth portal
+ *    name;
  *  - changeUserPassword ends the user's other sign-ins in the same
  *    transaction as the password write;
  *  - "has a password" counts a hash stored only on the credential account
@@ -50,17 +55,23 @@ vi.mock('@/src/lib/auth', () => ({
 }));
 
 import {
+  SignInUsernameError,
   changeUserPassword,
   createUser,
   getPasswordSignInStatus,
   getPasswordSignInUsername,
   getUserById,
   getUserPasswordHash,
-  repairLoginUsernames,
+  setUserSignInUsername,
+  updateUserAccount,
   updateUserProfile,
 } from '@/src/lib/models/user';
+import { SIGN_IN_USERNAME_RULES_MESSAGE } from '@/src/lib/login-username';
+import { SIGN_IN_NAME_TAKEN_MESSAGE } from '@/src/lib/sign-in-names';
+import { ApiValidationError } from '@/src/lib/api-errors';
 import { POST as changePassword } from '@/app/api/user/change-password/route';
 import { POST as unlinkOAuth } from '@/app/api/user/unlink-oauth/route';
+import { POST as updateAvatar } from '@/app/api/user/update-avatar/route';
 
 const NOW = '2026-02-01T00:00:00.000Z';
 const FUTURE = '2099-01-01T00:00:00.000Z';
@@ -208,49 +219,67 @@ describe('changeUserPassword', () => {
     expect(signInColumns(userId)).toEqual({ username: 'alice', displayUsername: 'Alice A.' });
   });
 
-  it('numbers the username when another user already signs in with the email', async () => {
+  it('leaves the username empty when another account signs in with the email', async () => {
     const holder = await seedUser('holder@example.com', null, 'dexuser@example.com');
     const userId = await seedUser('dexuser@example.com', null, null);
 
     await changeUserPassword(userId, 'new-hash', null);
 
-    expect(signInColumns(userId)?.username).toBe('dexuser-2@example.com');
+    // No numbered variant such as dexuser-2@example.com.
+    expect(signInColumns(userId)?.username).toBeNull();
     expect(signInColumns(holder)?.username).toBe('dexuser@example.com');
-    expect(await getPasswordSignInUsername(userId)).toBe('dexuser-2@example.com');
+    expect(credentialRows(userId)[0].password).toBe('new-hash');
+    expect(await getPasswordSignInStatus(userId)).toEqual({ username: null, blocker: 'no-username' });
   });
 
-  it('treats a username held in another case as taken', async () => {
+  it('treats a username or email held in another case as taken', async () => {
     await seedUser('holder@example.com', null, 'DexUser@Example.com');
-    const userId = await seedUser('dexuser@example.com', null, null);
+    const first = await seedUser('dexuser@example.com', null, null);
+    await seedUser('Carol@Example.com', null, null);
+    const second = await seedUser('carol@example.com', null, null);
 
-    await changeUserPassword(userId, 'new-hash', null);
+    await changeUserPassword(first, 'new-hash', null);
+    await changeUserPassword(second, 'new-hash', null);
 
-    expect(signInColumns(userId)?.username).toBe('dexuser-2@example.com');
+    expect(signInColumns(first)?.username).toBeNull();
+    expect(signInColumns(second)?.username).toBeNull();
   });
 
-  it('replaces characters the login page refuses in an email-derived username', async () => {
+  it('never makes a username from an email the login page refuses', async () => {
     const userId = await seedUser('Dex+Tag@example.com', null, null);
 
     await changeUserPassword(userId, 'new-hash', null);
 
-    expect(signInColumns(userId)).toEqual({ username: 'dex-tag@example.com', displayUsername: 'Dex+Tag@example.com' });
+    // Not dex-tag@example.com, which can be somebody else's address.
+    expect(signInColumns(userId)).toEqual({ username: null, displayUsername: null });
     expect(credentialRows(userId)[0].password).toBe('new-hash');
-    expect(await getPasswordSignInUsername(userId)).toBe('dex-tag@example.com');
+    expect(await getPasswordSignInUsername(userId)).toBeNull();
+    expect(await getPasswordSignInStatus(userId)).toEqual({ username: null, blocker: 'no-username' });
+    expect(db.select().from(users).where(eq(users.username, 'dex-tag@example.com')).all()).toEqual([]);
   });
 
-  it('leaves the derived username to the user whose email it is', async () => {
-    // Nobody signs in as dex-tag@example.com yet, but it is another user's email.
-    await seedUser('dex-tag@example.com', null, null);
-    await seedUser('holder@example.com', null, 'dex-tag-2@example.com');
-    const userId = await seedUser('dex+tag@example.com', null, null);
+  it('does not fold a look-alike character in a stored email into another address', async () => {
+    // createUser refuses such an address (see below); older rows can hold one.
+    const userId = await seedUser('\u212Aate@example.com', null, null);
 
     await changeUserPassword(userId, 'new-hash', null);
 
-    expect(signInColumns(userId)?.username).toBe('dex-tag-3@example.com');
+    // '\u212A'.toLowerCase() is 'k', which would make kate@example.com.
+    expect(signInColumns(userId)?.username).toBeNull();
   });
 
-  it('replaces a stored username the login page cannot find', async () => {
-    // createUser and the Better Auth migration used to copy the email as is.
+  it("does not give an account a username that is another account's forward-auth portal name", async () => {
+    // The portal reads "ops" as ops@localhost.
+    await seedUser('ops@localhost', null, 'ops@localhost');
+    const userId = await seedUser('ops', null, null);
+
+    await changeUserPassword(userId, 'new-hash', null);
+
+    expect(signInColumns(userId)?.username).toBeNull();
+  });
+
+  it('keeps a stored username the login page cannot find unless the email itself can replace it', async () => {
+    // Older releases copied the email as it was.
     const plus = await seedUser('alice+cpm@example.com', 'old-hash', 'alice+cpm@example.com');
     await seedCredentialAccount(plus, 'old-hash');
     await seedOAuthAccount(plus);
@@ -262,7 +291,8 @@ describe('changeUserPassword', () => {
     await changeUserPassword(plus, 'new-hash', null);
     await changeUserPassword(upper, 'new-hash', null);
 
-    expect(await getPasswordSignInUsername(plus)).toBe('alice-cpm@example.com');
+    expect(signInColumns(plus)?.username).toBe('alice+cpm@example.com');
+    expect(await getPasswordSignInStatus(plus)).toEqual({ username: null, blocker: 'no-username' });
     expect(await getPasswordSignInUsername(upper)).toBe('bob@example.com');
   });
 
@@ -302,37 +332,87 @@ describe('changeUserPassword', () => {
 });
 
 describe('createUser', () => {
-  it('uses the email as username when the login page accepts it', async () => {
+  it('uses the lowercased email as username when the login page accepts it', async () => {
     const user = await createUser({ email: 'Carol@Example.com', provider: 'credentials', subject: 'carol', passwordHash: 'h' });
     expect(signInColumns(user.id)?.username).toBe('carol@example.com');
+    expect(user.username).toBe('carol@example.com');
     expect(await getPasswordSignInUsername(user.id)).toBe('carol@example.com');
   });
 
-  it('gives a plus-addressed email a username the login page accepts', async () => {
+  it('gives a plus-addressed email no username', async () => {
     const user = await createUser({ email: 'carol+cpm@example.com', provider: 'credentials', subject: 'carol', passwordHash: 'h' });
-    expect(signInColumns(user.id)?.username).toBe('carol-cpm@example.com');
-    expect(await getPasswordSignInUsername(user.id)).toBe('carol-cpm@example.com');
+    expect(user.username).toBeNull();
+    expect(signInColumns(user.id)?.username).toBeNull();
+    expect(await getPasswordSignInStatus(user.id)).toEqual({ username: null, blocker: 'no-username' });
   });
 
-  it('does not reuse a username another user signs in with', async () => {
+  it.each(['+alice@example.com', 'alice@example.com+', 'j\u00f6hn@example.com', 'a b@example.com', '"a"@b'])(
+    'gives %s no username',
+    async (email) => {
+      const user = await createUser({ email, provider: 'credentials', subject: email, passwordHash: 'h' });
+      expect(user.username).toBeNull();
+    }
+  );
+
+  it('refuses an email that lowercasing turns into another address, instead of storing that one', async () => {
+    for (const email of ['\u212Aate@example.com', 'K\u212Aate@example.com', '\u0130van@example.com']) {
+      const attempt = createUser({ email, provider: 'credentials', subject: email, passwordHash: 'h' });
+      await expect(attempt).rejects.toThrow(ApiValidationError);
+      await expect(attempt).rejects.toThrow(/Kelvin sign/);
+    }
+    expect(db.select().from(users).all()).toEqual([]);
+
+    // The same account created with plain letters, then given a password.
+    const user = await createUser({ email: 'Kate@example.com', provider: 'credentials', subject: 'kate' });
+    await changeUserPassword(user.id, 'new-hash', null);
+    expect((await getUserById(user.id))).toMatchObject({ email: 'kate@example.com', username: 'kate@example.com' });
+  });
+
+  it('refuses an email address another account has or signs in with, instead of numbering a username', async () => {
     await seedUser('holder@example.com', null, 'carol@example.com');
-    const user = await createUser({ email: 'carol@example.com', provider: 'credentials', subject: 'carol', passwordHash: 'h' });
-    expect(signInColumns(user.id)?.username).toBe('carol-2@example.com');
-    // Administrators see the name the user has to type in what createUser returns.
-    expect(user.username).toBe('carol-2@example.com');
-    expect((await getUserById(user.id))?.username).toBe('carol-2@example.com');
+    await seedUser('Dora@Example.com', null, null);
+    await seedUser('erin@example.com', null, 'ops');
+    for (const [email, message] of [
+      ['carol@example.com', 'Another account signs in with this email address as its username'],
+      ['dora@example.com', 'A user with this email already exists'],
+      ['Ops@localhost', 'Another account signs in with the name before @localhost as its username'],
+    ]) {
+      const attempt = createUser({ email, provider: 'credentials', subject: email, passwordHash: 'h' });
+      await expect(attempt).rejects.toThrow(ApiValidationError);
+      await expect(attempt).rejects.toThrow(message);
+    }
+    expect(db.select().from(users).all()).toHaveLength(3);
+    expect(db.select().from(accounts).all()).toEqual([]);
   });
 
   it('leaves a plain address to its owner when a similar one was created first', async () => {
     const plus = await createUser({ email: '+alice@example.com', provider: 'credentials', subject: 'a1', passwordHash: 'h' });
     const owner = await createUser({ email: 'alice@example.com', provider: 'credentials', subject: 'a2', passwordHash: 'h' });
-    expect(plus.username).toBe('-alice@example.com');
+    expect(plus.username).toBeNull();
     expect(owner.username).toBe('alice@example.com');
   });
 
-  it('keeps an explicit username', async () => {
-    const user = await createUser({ email: 'dave@example.com', provider: 'credentials', subject: 'dave', username: 'admin' });
+  it('keeps an explicit username, trimmed', async () => {
+    const user = await createUser({ email: 'dave@example.com', provider: 'credentials', subject: 'dave', username: ' admin ' });
     expect(signInColumns(user.id)?.username).toBe('admin');
+  });
+
+  it('refuses an explicit username the login page cannot use or another account holds', async () => {
+    await seedUser('Taken@Example.com', null, 'erin');
+    for (const [username, message] of [
+      ['Dave', SIGN_IN_USERNAME_RULES_MESSAGE],
+      ['dave+x@example.com', SIGN_IN_USERNAME_RULES_MESSAGE],
+      ['', SIGN_IN_USERNAME_RULES_MESSAGE],
+      ['ERIN', SIGN_IN_USERNAME_RULES_MESSAGE],
+      ['erin', SIGN_IN_NAME_TAKEN_MESSAGE],
+      ['taken@example.com', SIGN_IN_NAME_TAKEN_MESSAGE],
+    ]) {
+      const attempt = createUser({ email: 'dave@example.com', provider: 'credentials', subject: 'dave', passwordHash: 'h', username });
+      await expect(attempt).rejects.toThrow(SignInUsernameError);
+      await expect(attempt).rejects.toThrow(message);
+    }
+    expect(db.select().from(users).where(eq(users.email, 'dave@example.com')).all()).toEqual([]);
+    expect(db.select().from(accounts).all()).toEqual([]);
   });
 });
 
@@ -374,17 +454,6 @@ describe('getPasswordSignInUsername', () => {
   });
 });
 
-/** Takes every username that could be made from dex+tag@example.com. */
-async function takeEveryDexTagUsername() {
-  const emails = ['dex-tag@example.com'];
-  for (let n = 2; n <= 1000; n++) emails.push(`dex-tag-${n}@example.com`);
-  for (let i = 0; i < emails.length; i += 100) {
-    await db.insert(users).values(emails.slice(i, i + 100).map((email) => ({
-      email, name: email, role: 'user', status: 'active', createdAt: NOW, updatedAt: NOW,
-    })));
-  }
-}
-
 describe('getPasswordSignInStatus', () => {
   it('returns the username when the login page can sign the user in', async () => {
     const userId = await seedUser('local@example.com', 'hash');
@@ -396,18 +465,17 @@ describe('getPasswordSignInStatus', () => {
     const oauthOnly = await seedUser('oauth@example.com', null, null);
     await seedOAuthAccount(oauthOnly);
     const legacy = await seedUser('legacy@example.com', 'users-hash');
-    const plus = await seedUser('alice+cpm@example.com', null, 'alice+cpm@example.com');
-    await seedCredentialAccount(plus, 'hash');
+    const upper = await seedUser('bob@example.com', null, 'Bob');
+    await seedCredentialAccount(upper, 'hash');
 
-    for (const userId of [oauthOnly, legacy, plus]) {
+    for (const userId of [oauthOnly, legacy, upper]) {
       expect(await getPasswordSignInStatus(userId)).toEqual({ username: null, blocker: 'no-credential' });
       await changeUserPassword(userId, 'new-hash', null);
       expect((await getPasswordSignInStatus(userId)).blocker).toBeNull();
     }
   });
 
-  it('reports no-username when no username can be made from the email', async () => {
-    await takeEveryDexTagUsername();
+  it('reports no-username until an administrator sets one', async () => {
     const userId = await seedUser('dex+tag@example.com', null, null);
     await seedOAuthAccount(userId);
     expect(await getPasswordSignInStatus(userId)).toEqual({ username: null, blocker: 'no-username' });
@@ -416,20 +484,19 @@ describe('getPasswordSignInStatus', () => {
     expect(signInColumns(userId)?.username).toBeNull();
     expect(await getPasswordSignInStatus(userId)).toEqual({ username: null, blocker: 'no-username' });
 
-    // Their password is on the credential account, so a new email address
-    // gives them a username without another password change.
-    await updateUserProfile(userId, { email: 'dex@example.com' });
-    expect(await getPasswordSignInStatus(userId)).toEqual({ username: 'dex@example.com', blocker: null });
-  });
-
-  it('asks a user without a password to set one once the email allows a username', async () => {
-    await takeEveryDexTagUsername();
-    const userId = await seedUser('dex+tag@example.com', null, null);
-    await seedOAuthAccount(userId);
-
+    // A new email address gives no username by itself.
     await updateUserProfile(userId, { email: 'dex@example.com' });
     expect(signInColumns(userId)?.username).toBeNull();
-    expect(await getPasswordSignInStatus(userId)).toEqual({ username: null, blocker: 'no-credential' });
+
+    await setUserSignInUsername(userId, 'dex');
+    expect(await getPasswordSignInStatus(userId)).toEqual({ username: 'dex', blocker: null });
+  });
+
+  it('reports no-username when another account has the email as username', async () => {
+    await seedUser('holder@example.com', null, 'dex@example.com');
+    const userId = await seedUser('dex@example.com', null, null);
+    await seedOAuthAccount(userId);
+    expect(await getPasswordSignInStatus(userId)).toEqual({ username: null, blocker: 'no-username' });
   });
 });
 
@@ -454,7 +521,7 @@ describe('password routes against the database', () => {
     expect(unlinked.status).toBe(200);
   });
 
-  it('lets a plus-addressed OAuth-only user set a password and then unlink OAuth', async () => {
+  it('lets a plus-addressed OAuth-only user unlink OAuth only once an administrator set a username', async () => {
     const userId = await seedUser('alice+cpm@example.com', null, null);
     await seedOAuthAccount(userId);
     caller.userId = userId;
@@ -463,8 +530,13 @@ describe('password routes against the database', () => {
 
     const res = await changePassword(post('/api/user/change-password', { newPassword: PASSWORD }));
     expect(res.status).toBe(200);
-    expect(await getPasswordSignInUsername(userId)).toBe('alice-cpm@example.com');
+    expect(signInColumns(userId)?.username).toBeNull();
+    expect(await getPasswordSignInUsername(userId)).toBeNull();
 
+    const refused = await unlinkOAuth(post('/api/user/unlink-oauth'));
+    expect(refused.status).toBe(400);
+
+    await setUserSignInUsername(userId, 'alice');
     const unlinked = await unlinkOAuth(post('/api/user/unlink-oauth'));
     expect(unlinked.status).toBe(200);
   });
@@ -536,101 +608,160 @@ describe('password routes against the database', () => {
 });
 
 describe('updateUserProfile', () => {
-  it('gives a user with a password a username the login page can find', async () => {
+  it('leaves a username the login page cannot find as it is', async () => {
     // Stored by older releases, which copied the email as it was.
     const userId = await seedUser('carol+cpm@example.com', 'hash', 'carol+cpm@example.com');
     await seedCredentialAccount(userId, 'hash');
-    expect(await getPasswordSignInUsername(userId)).toBeNull();
+    db.update(users).set({ displayUsername: 'carol+cpm' }).where(eq(users.id, userId)).run();
 
     const updated = await updateUserProfile(userId, { name: 'Carol' });
 
-    expect(updated?.username).toBe('carol-cpm@example.com');
-    expect(signInColumns(userId)).toEqual({ username: 'carol-cpm@example.com', displayUsername: 'Carol' });
-    expect(await getPasswordSignInUsername(userId)).toBe('carol-cpm@example.com');
+    expect(updated?.username).toBe('carol+cpm@example.com');
+    expect(signInColumns(userId)).toEqual({ username: 'carol+cpm@example.com', displayUsername: 'carol+cpm' });
+    expect(await getPasswordSignInUsername(userId)).toBeNull();
   });
 
-  it('makes the username from the new email', async () => {
-    const userId = await seedUser('carol+cpm@example.com', 'hash', 'carol+cpm@example.com');
-    await seedCredentialAccount(userId, 'hash');
+  it('does not make a username from a new email', async () => {
+    const plus = await seedUser('carol+cpm@example.com', 'hash', 'carol+cpm@example.com');
+    await seedCredentialAccount(plus, 'hash');
+    const empty = await seedUser('dex+tag@example.com', 'hash', null);
+    await seedCredentialAccount(empty, 'hash');
 
-    await updateUserProfile(userId, { email: 'carol@example.com' });
+    await updateUserProfile(plus, { email: 'carol@example.com' });
+    await updateUserProfile(empty, { email: 'dex@example.com' });
 
-    expect(await getPasswordSignInUsername(userId)).toBe('carol@example.com');
+    expect(signInColumns(plus)?.username).toBe('carol+cpm@example.com');
+    expect(signInColumns(empty)?.username).toBeNull();
   });
 
-  it('does not fold a look-alike character in a new email into another address', async () => {
-    await seedUser('kate@example.com');
-    const userId = await seedUser('erin+x@example.com', 'hash', 'erin+x@example.com');
-    await seedCredentialAccount(userId, 'hash');
+  it("refuses a new email address another account has or signs in with, and changes nothing", async () => {
+    await seedUser('anna@example.com', 'hash', 'boss@example.com');
+    await seedUser('Dora@Example.com', null, null);
+    await seedUser('erin@example.com', null, 'ops');
+    const userId = await seedUser('ben@example.com', 'hash', 'ben@example.com');
 
-    await updateUserProfile(userId, { email: '\u212Aate@example.com' });
-
-    expect(signInColumns(userId)?.username).toBe('-ate@example.com');
+    for (const [email, message] of [
+      ['boss@example.com', 'Another account signs in with this email address as its username'],
+      ['BOSS@example.com', 'Another account signs in with this email address as its username'],
+      ['dora@example.com', 'A user with this email already exists'],
+      ['ops@localhost', 'Another account signs in with the name before @localhost as its username'],
+    ]) {
+      const attempt = updateUserProfile(userId, { email, name: 'Changed' });
+      await expect(attempt).rejects.toThrow(ApiValidationError);
+      await expect(attempt).rejects.toThrow(message);
+    }
+    expect(await getUserById(userId)).toMatchObject({ email: 'ben@example.com', name: 'ben@example.com' });
   });
 
-  it('keeps a username that works and leaves users without a password alone', async () => {
+  it('allows a new case of the email address the user has', async () => {
+    const userId = await seedUser('ben@example.com', 'hash', 'ben@example.com');
+    expect((await updateUserProfile(userId, { email: 'Ben@Example.com' }))?.email).toBe('Ben@Example.com');
+  });
+
+  it('keeps a username that works when the email changes', async () => {
     const working = await seedUser('alice@example.com', 'hash', 'alice@example.com');
     await seedCredentialAccount(working, 'hash');
-    const oauthOnly = await seedUser('dex+tag@example.com', null, null);
-    await seedOAuthAccount(oauthOnly);
 
     await updateUserProfile(working, { email: 'alice.new@example.com' });
-    await updateUserProfile(oauthOnly, { name: 'Dex' });
 
     expect(signInColumns(working)?.username).toBe('alice@example.com');
+  });
+
+  it('leaves the username alone when a user changes their avatar', async () => {
+    const userId = await seedUser('erin+cpm@example.com', 'hash', 'erin+cpm@example.com');
+    await seedCredentialAccount(userId, 'hash');
+    const oauthOnly = await seedUser('fay+cpm@example.com', null, null);
+    await seedOAuthAccount(oauthOnly);
+
+    for (const id of [userId, oauthOnly]) {
+      caller.userId = id;
+      const res = await updateAvatar(post('/api/user/update-avatar', { avatarUrl: 'data:image/png;base64,AAAA' }));
+      expect(res.status).toBe(200);
+    }
+
+    expect(signInColumns(userId)?.username).toBe('erin+cpm@example.com');
     expect(signInColumns(oauthOnly)?.username).toBeNull();
   });
 });
 
-describe('repairLoginUsernames', () => {
-  it('gives every user with a password a username the login page can find', async () => {
-    const plus = await seedUser('carol+cpm@example.com', 'hash', 'carol+cpm@example.com');
-    await seedCredentialAccount(plus, 'hash');
-    const upper = await seedUser('bob@example.com', 'hash', 'Bob');
-    await seedCredentialAccount(upper, 'hash');
-    const selfRegistered = await seedUser('self+x@example.com', null, null);
-    await seedCredentialAccount(selfRegistered, 'hash');
-    // Both derive carol-cpm@example.com; the second one is numbered.
-    const twin = await seedUser('carol%cpm@example.com', 'hash', 'carol%cpm@example.com');
-    await seedCredentialAccount(twin, 'hash');
-
-    const repaired = await repairLoginUsernames();
-
-    expect(repaired).toEqual([
-      { userId: plus, username: 'carol-cpm@example.com' },
-      { userId: upper, username: 'bob@example.com' },
-      { userId: selfRegistered, username: 'self-x@example.com' },
-      { userId: twin, username: 'carol-cpm-2@example.com' },
-    ]);
-    for (const { userId, username } of repaired) {
-      expect(await getPasswordSignInStatus(userId)).toEqual({ username, blocker: null });
-    }
-    expect(await repairLoginUsernames()).toEqual([]);
-  });
-
-  it('leaves working usernames and users without a password on the credential account alone', async () => {
-    const working = await seedUser('alice@example.com', 'hash', 'alice');
-    await seedCredentialAccount(working, 'hash');
-    const oauthOnly = await seedUser('dex+tag@example.com', null, 'dex+tag@example.com');
-    await seedOAuthAccount(oauthOnly);
-    const legacy = await seedUser('legacy+x@example.com', 'hash', 'legacy+x@example.com');
-    const emptyCredential = await seedUser('empty+x@example.com', null, null);
-    await seedCredentialAccount(emptyCredential, null);
-
-    expect(await repairLoginUsernames()).toEqual([]);
-
-    expect(signInColumns(working)?.username).toBe('alice');
-    expect(signInColumns(oauthOnly)?.username).toBe('dex+tag@example.com');
-    expect(signInColumns(legacy)?.username).toBe('legacy+x@example.com');
-    expect(signInColumns(emptyCredential)?.username).toBeNull();
-  });
-
-  it('skips a user no username can be made for', async () => {
-    await takeEveryDexTagUsername();
-    const userId = await seedUser('dex+tag@example.com', 'hash', 'dex+tag@example.com');
+describe('setUserSignInUsername', () => {
+  it('sets the username and display username and returns the previous one', async () => {
+    const userId = await seedUser('alice+cpm@example.com', 'hash', 'alice+cpm@example.com');
     await seedCredentialAccount(userId, 'hash');
 
-    expect(await repairLoginUsernames()).toEqual([]);
-    expect(await getPasswordSignInStatus(userId)).toEqual({ username: null, blocker: 'no-username' });
+    const result = await setUserSignInUsername(userId, '  alice.cpm  ');
+
+    expect(result?.previousUsername).toBe('alice+cpm@example.com');
+    expect(result?.user.username).toBe('alice.cpm');
+    expect(signInColumns(userId)).toEqual({ username: 'alice.cpm', displayUsername: 'alice.cpm' });
+    expect(await getPasswordSignInStatus(userId)).toEqual({ username: 'alice.cpm', blocker: null });
+  });
+
+  it.each(['', '  ', 'ab', 'Alice', 'alice+cpm@example.com', 'bad name', 'j\u00f6hn', 'a'.repeat(256)])(
+    'refuses %j',
+    async (username) => {
+      const userId = await seedUser('alice@example.com', null, 'alice');
+      const attempt = setUserSignInUsername(userId, username);
+      await expect(attempt).rejects.toThrow(SignInUsernameError);
+      await expect(attempt).rejects.toThrow(SIGN_IN_USERNAME_RULES_MESSAGE);
+      expect(signInColumns(userId)?.username).toBe('alice');
+    }
+  );
+
+  it("refuses another account's username, email or forward-auth portal name, whatever its case", async () => {
+    await seedUser('Holder@Example.com', null, 'Holder');
+    // The portal reads "ops" as ops@localhost.
+    await seedUser('Ops@localhost', null, 'ops@localhost');
+    const userId = await seedUser('alice@example.com', null, 'alice');
+
+    for (const username of ['holder', 'holder@example.com', 'ops', 'ops@localhost']) {
+      await expect(setUserSignInUsername(userId, username)).rejects.toThrow(SIGN_IN_NAME_TAKEN_MESSAGE);
+    }
+    expect(signInColumns(userId)?.username).toBe('alice');
+  });
+
+  it('allows the portal name of the account itself', async () => {
+    const userId = await seedUser('ops@localhost', null, null);
+    expect((await setUserSignInUsername(userId, 'ops'))?.user.username).toBe('ops');
+  });
+
+  it("allows the account's own email and current username", async () => {
+    const userId = await seedUser('Alice@Example.com', null, 'alice');
+
+    expect((await setUserSignInUsername(userId, 'alice'))?.user.username).toBe('alice');
+    expect((await setUserSignInUsername(userId, 'alice@example.com'))?.user.username).toBe('alice@example.com');
+  });
+
+  it('returns null for a user that does not exist', async () => {
+    expect(await setUserSignInUsername(999, 'nobody')).toBeNull();
+  });
+});
+
+describe('updateUserAccount', () => {
+  it('changes nothing when the username or the email address is refused', async () => {
+    await seedUser('holder@example.com', null, 'holder');
+    const userId = await seedUser('alice@example.com', null, 'alice');
+
+    await expect(updateUserAccount(userId, { username: 'bob', email: 'holder@example.com', name: 'Changed' }))
+      .rejects.toThrow('A user with this email already exists');
+    await expect(updateUserAccount(userId, { username: 'holder', email: 'alice.new@example.com', name: 'Changed' }))
+      .rejects.toThrow(SIGN_IN_NAME_TAKEN_MESSAGE);
+
+    expect(await getUserById(userId)).toMatchObject({ username: 'alice', email: 'alice@example.com', name: 'alice@example.com' });
+  });
+
+  it('saves the other fields when the username is the one the user already has, even one the login page refuses', async () => {
+    const userId = await seedUser('carol+cpm@example.com', null, 'carol+cpm@example.com');
+
+    const result = await updateUserAccount(userId, { username: 'carol+cpm@example.com', name: 'Carol' });
+
+    expect(result?.previousUsername).toBe('carol+cpm@example.com');
+    expect(result?.user).toMatchObject({ username: 'carol+cpm@example.com', name: 'Carol' });
+  });
+
+  it('treats an empty username as no change for a user without one', async () => {
+    const userId = await seedUser('dex+tag@example.com', null, null);
+    const result = await updateUserAccount(userId, { username: '', name: 'Dex' });
+    expect(result?.user).toMatchObject({ username: null, name: 'Dex' });
   });
 });

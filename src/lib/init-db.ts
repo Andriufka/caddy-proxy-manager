@@ -5,6 +5,7 @@ import { users, accounts, settings } from "./db/schema";
 import { and, eq } from "drizzle-orm";
 import { CREDENTIAL_ACCOUNT_ISSUER } from "./account-issuer";
 import { changeUserPassword, deleteOrphanedUserReferences } from "./models/user";
+import { isSignInNameTaken, signInEmailConflict } from "./sign-in-names";
 
 const BCRYPT_COST = 12;
 
@@ -64,6 +65,22 @@ async function isKnownPublicPassword(hash: string): Promise<boolean> {
 }
 
 /**
+ * Throws unless the primary admin can take the username and email address in
+ * `identity`: no other account may sign in with either or have it as its
+ * email address (see sign-in-names.ts), or one name would reach two accounts.
+ * Nothing is written then, and the next start tries again.
+ */
+function assertAdminIdentityAvailable(adminId: number, identity: { username: string; email: string }): void {
+  if (isSignInNameTaken(db, adminId, identity.username) || signInEmailConflict(db, adminId, identity.email)) {
+    throw new Error(
+      `ADMIN_USERNAME ${JSON.stringify(config.adminUsername)} is not applied: another account already signs in with it ` +
+      "or has it as its email address. Give that account a different username or email address on the Users page, " +
+      "or choose another ADMIN_USERNAME."
+    );
+  }
+}
+
+/**
  * Ensures the admin user from environment variables exists in the database.
  * This is called during application startup.
  * The password from environment variables is hashed and stored securely.
@@ -120,6 +137,10 @@ export async function ensureAdminUser(): Promise<void> {
       username: config.adminUsername.toLowerCase(),
       displayUsername: config.adminUsername,
     };
+    const appliesIdentity = applyEnvCredentials || (!marker && existingUser.username !== identity.username);
+    if (appliesIdentity && (existingUser.username !== identity.username || existingUser.email !== identity.email)) {
+      assertAdminIdentityAvailable(adminId, identity);
+    }
     if (applyEnvCredentials) {
       const passwordChanged = !(await envPasswordIsStored());
       const passwordHash = storedHash && !passwordChanged
@@ -171,6 +192,9 @@ export async function ensureAdminUser(): Promise<void> {
     return;
   }
 
+  const username = config.adminUsername.toLowerCase();
+  assertAdminIdentityAvailable(adminId, { username, email: adminEmail });
+
   // Hash the admin password for secure storage
   const passwordHash = await bcrypt.hash(config.adminPassword, BCRYPT_COST);
 
@@ -184,7 +208,7 @@ export async function ensureAdminUser(): Promise<void> {
     role: "admin",
     provider,
     subject,
-    username: config.adminUsername.toLowerCase(),
+    username,
     displayUsername: config.adminUsername,
     avatarUrl: null,
     status: "active",

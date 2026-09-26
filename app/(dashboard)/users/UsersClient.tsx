@@ -12,6 +12,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useRouter } from "next/navigation";
 import { passwordPolicyMessage } from "@/src/lib/password-policy";
+import { isUsableSignInUsername } from "@/src/lib/login-username";
 import {
   createUserAction,
   updateUserRoleAction,
@@ -263,10 +264,19 @@ function UserRow({
         </div>
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
           <span className="truncate">{user.email}</span>
-          {user.username && user.username !== user.email.toLowerCase() && (
+          {isUsableSignInUsername(user.username) ? (
+            user.username !== user.email.toLowerCase() && (
+              <>
+                <span>·</span>
+                <span className="truncate" title="Username">{user.username}</span>
+              </>
+            )
+          ) : (
             <>
               <span>·</span>
-              <span className="truncate" title="Username">{user.username}</span>
+              <span title="The login page cannot sign this user in with a password until a username is set">
+                no sign-in username
+              </span>
             </>
           )}
           <span>·</span>
@@ -362,6 +372,7 @@ function EditUserRow({
           const formData = new FormData(event.currentTarget);
           setError(null);
           setPending(true);
+          // Name, email and username are saved together or not at all.
           let failure = await runUserAction(() => updateUserInfoAction(user.id, formData), "Failed to update user");
           if (!failure && role !== user.role) {
             failure = await runUserAction(() => updateUserRoleAction(user.id, role), "Failed to update user role");
@@ -373,7 +384,7 @@ function EditUserRow({
           }
           onSave();
         }}
-        className="grid grid-cols-1 sm:grid-cols-3 gap-3"
+        className="grid grid-cols-1 sm:grid-cols-2 gap-3"
       >
         <div className="space-y-1">
           <Label htmlFor={`name-${user.id}`}>Name</Label>
@@ -394,6 +405,21 @@ function EditUserRow({
           />
         </div>
         <div className="space-y-1">
+          <Label htmlFor={`username-${user.id}`}>Username</Label>
+          <Input
+            id={`username-${user.id}`}
+            name="username"
+            defaultValue={user.username ?? ""}
+            placeholder="Sign-in username"
+            autoCapitalize="none"
+            autoComplete="off"
+            spellCheck={false}
+          />
+          <p className="text-xs text-muted-foreground">
+            What the user types on the login page: lowercase letters, digits and _ . @ -
+          </p>
+        </div>
+        <div className="space-y-1">
           <Label>Role</Label>
           <Select value={role} onValueChange={(v) => setRole(v as UserEntry["role"])}>
             <SelectTrigger>
@@ -406,7 +432,7 @@ function EditUserRow({
             </SelectContent>
           </Select>
         </div>
-        <div className="sm:col-span-3 flex gap-2">
+        <div className="sm:col-span-2 flex gap-2">
           <Button type="submit" size="sm" disabled={pending}>Save</Button>
           <Button type="button" variant="ghost" size="sm" onClick={onClose}>Cancel</Button>
         </div>

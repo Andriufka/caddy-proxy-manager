@@ -1,8 +1,9 @@
 /**
- * A username CPM makes from an email the login page refuses (here one with a
- * '+') works on Better Auth's username sign-in, whatever case it is typed in,
- * including for accounts that older releases stored such an email for as the
- * username, once they are repaired without the user signing in.
+ * Better Auth's username sign-in only reaches an account by a username CPM
+ * stored on purpose: the account's own email, or one an administrator set.
+ * An email the login page refuses (here one with a '+') is never turned into
+ * a username, so no account can sign in as a lookalike address such as
+ * alice-cpm@example.com, which may be somebody else's.
  *
  * Like auth-password-policy-endpoints.test.ts, this boots the real db module
  * and the real auth-server (no better-auth stub) against a file-backed SQLite
@@ -15,8 +16,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CREDENTIAL_ACCOUNT_ISSUER } from '../../src/lib/account-issuer';
 
-const workDir = mkdtempSync(join(tmpdir(), 'cpm-derived-username-'));
+const workDir = mkdtempSync(join(tmpdir(), 'cpm-sign-in-username-'));
 const PASSWORD = 'Correct-Horse-9!';
+const OTHER_PASSWORD = 'Another-Horse-7!';
 
 const globalForDb = globalThis as {
   __SQLITE_CLIENT__?: { close: () => void };
@@ -78,6 +80,24 @@ async function trySignIn(username: string, password: string): Promise<string | n
   }
 }
 
+/** The way an OAuth sign-up provisions a user: no username, no password. */
+async function seedOAuthUser(email: string) {
+  const { db, schema } = app;
+  const now = new Date().toISOString();
+  const [user] = await db.insert(schema.users).values({
+    email,
+    name: null,
+    role: 'user',
+    status: 'active',
+    provider: 'dex',
+    subject: `dex-${email}`,
+    emailVerified: false,
+    createdAt: now,
+    updatedAt: now,
+  }).returning();
+  return user;
+}
+
 /**
  * A credential-only account as older releases created it: the email, here
  * plus-addressed, copied as the username.
@@ -112,31 +132,37 @@ async function seedLegacyCredentialUser(email: string) {
   return user;
 }
 
-describe('derived sign-in usernames', () => {
-  it('signs in a plus-addressed OAuth user who set a password through CPM', async () => {
-    const { db, schema, userModel } = app;
-    const now = new Date().toISOString();
-    // The way an OAuth sign-up provisions a user: no username, no password.
-    const [user] = await db.insert(schema.users).values({
-      email: 'dex+cpm@example.com',
-      name: 'Dex User',
-      role: 'user',
-      status: 'active',
-      provider: 'dex',
-      subject: 'dex-subject',
-      emailVerified: false,
-      createdAt: now,
-      updatedAt: now,
-    }).returning();
+describe('sign-in usernames', () => {
+  it('gives a plus-addressed OAuth user who sets a password no username made from their email', async () => {
+    const user = await seedOAuthUser('dex+cpm@example.com');
 
-    await userModel.changeUserPassword(user.id, bcrypt.hashSync(PASSWORD, 4), null);
+    await app.userModel.changeUserPassword(user.id, bcrypt.hashSync(PASSWORD, 4), null);
 
-    expect(await userModel.getPasswordSignInUsername(user.id)).toBe('dex-cpm@example.com');
-    expect(await signIn('dex-cpm@example.com', PASSWORD)).toBe(String(user.id));
-    expect(await signIn('Dex-CPM@Example.com', PASSWORD)).toBe(String(user.id));
+    expect(await app.userModel.getPasswordSignInStatus(user.id)).toEqual({ username: null, blocker: 'no-username' });
+    expect(await trySignIn('dex-cpm@example.com', PASSWORD)).toBeNull();
+    expect(await trySignIn('dex+cpm@example.com', PASSWORD)).toBeNull();
   });
 
-  it('signs in a plus-addressed user an administrator created', async () => {
+  it('does not let an account sign in as an address derived from its email', async () => {
+    // Formerly this account became alice-x@example.com, and the real owner of
+    // that address got alice-x-2@example.com.
+    const squatter = await seedOAuthUser('alice+x@example.com');
+    await app.userModel.changeUserPassword(squatter.id, bcrypt.hashSync(PASSWORD, 4), null);
+
+    const owner = await app.userModel.createUser({
+      email: 'alice-x@example.com',
+      provider: 'credentials',
+      subject: 'alice-x@example.com',
+      passwordHash: bcrypt.hashSync(OTHER_PASSWORD, 4),
+    });
+
+    expect(owner.username).toBe('alice-x@example.com');
+    expect(await signIn('alice-x@example.com', OTHER_PASSWORD)).toBe(String(owner.id));
+    expect(await trySignIn('alice-x@example.com', PASSWORD)).toBeNull();
+    expect(await trySignIn('alice-x-2@example.com', OTHER_PASSWORD)).toBeNull();
+  });
+
+  it('gives a plus-addressed user an administrator created no username', async () => {
     const user = await app.userModel.createUser({
       email: 'carol+cpm@example.com',
       provider: 'credentials',
@@ -144,24 +170,29 @@ describe('derived sign-in usernames', () => {
       passwordHash: bcrypt.hashSync(PASSWORD, 4),
     });
 
-    expect(await signIn('carol-cpm@example.com', PASSWORD)).toBe(String(user.id));
+    expect(user.username).toBeNull();
+    expect(await trySignIn('carol-cpm@example.com', PASSWORD)).toBeNull();
   });
 
-  it('signs in a legacy plus-addressed credential user after the startup repair', async () => {
+  it('leaves a legacy plus-addressed username alone when an administrator edits the profile', async () => {
+    const user = await seedLegacyCredentialUser('fay+cpm@example.com');
+
+    await app.userModel.updateUserProfile(user.id, { name: 'Fay', email: 'fay@example.com' });
+
+    expect((await app.userModel.getUserById(user.id))?.username).toBe('fay+cpm@example.com');
+    expect(await trySignIn('fay-cpm@example.com', PASSWORD)).toBeNull();
+    expect(await trySignIn('fay@example.com', PASSWORD)).toBeNull();
+  });
+
+  it('signs in a legacy plus-addressed user with the username an administrator set, in any case', async () => {
     const user = await seedLegacyCredentialUser('erin+cpm@example.com');
     expect(await trySignIn('erin+cpm@example.com', PASSWORD)).toBeNull();
     expect(await trySignIn('erin-cpm@example.com', PASSWORD)).toBeNull();
 
-    await app.userModel.repairLoginUsernames();
+    await app.userModel.setUserSignInUsername(user.id, 'erin');
 
-    expect(await signIn('erin-cpm@example.com', PASSWORD)).toBe(String(user.id));
-  });
-
-  it('signs in a legacy plus-addressed credential user after an administrator edits them', async () => {
-    const user = await seedLegacyCredentialUser('fay+cpm@example.com');
-
-    await app.userModel.updateUserProfile(user.id, { name: 'Fay' });
-
-    expect(await signIn('fay-cpm@example.com', PASSWORD)).toBe(String(user.id));
+    expect(await signIn('erin', PASSWORD)).toBe(String(user.id));
+    expect(await signIn('ERIN', PASSWORD)).toBe(String(user.id));
+    expect(await trySignIn('erin-cpm@example.com', PASSWORD)).toBeNull();
   });
 });
