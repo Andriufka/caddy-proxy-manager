@@ -51,7 +51,10 @@ export function mapOAuthProvider(p: OAuthProvider): GenericOAuthConfig {
     // Ownership of an existing CPM account is asserted by the operator through
     // the provider's auto-link switch, never by the IdP alone. Reporting the
     // claim only for auto-link providers keeps a provider that merely returns
-    // `email_verified: true` from attaching itself to a local account.
+    // `email_verified: true` from attaching itself to a local account. The
+    // switch does not depend on the claim: Better Auth links an auto-link
+    // (trusted) provider's identity by matching email even when the claim is
+    // missing or false, so the switch trusts the provider's addresses.
     mapProfileToUser: (profile) => ({
       emailVerified: p.autoLink === true && profileEmailVerified(profile),
     }),
@@ -273,10 +276,16 @@ function createAuth(): any {
             try {
               named = applySignInNameRules(user, selfRegistered);
             } catch (error) {
-              // Self-registration answers with the reason; an OAuth sign-up
-              // fails as Better Auth's "unable to create user".
+              // Self-registration answers as Better Auth does for an email
+              // address an account already has, whatever the reason, so the
+              // reply does not tell whether a name is another account's
+              // username or portal name. An OAuth sign-up fails as Better
+              // Auth's "unable to create user".
               if (selfRegistered && error instanceof ApiClientError) {
-                throw new APIError("BAD_REQUEST", { message: error.message });
+                throw new APIError("UNPROCESSABLE_ENTITY", {
+                  message: "User already exists. Use another email.",
+                  code: "USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL",
+                });
               }
               throw error;
             }
@@ -288,6 +297,10 @@ function createAuth(): any {
               return { data: named };
             }
             return { data: enforceSafeUserDefaults(named) };
+          },
+          after: async (user: { id: string | number }) => {
+            const { releaseContestedSignInUsername } = await import("./models/user");
+            releaseContestedSignInUsername(Number(user.id));
           },
         },
       },
@@ -414,6 +427,24 @@ function createAuth(): any {
       },
       session: {
         create: {
+          // A disabled account gets no session. CPM's own routes refuse one,
+          // but Better Auth's endpoints would accept it, and a successful
+          // sign-in would confirm the password. The refusal is the one a
+          // wrong password gets.
+          before: async (session: { userId: string | number }, context?: { path?: string } | null) => {
+            const user = db
+              .select({ status: schema.users.status })
+              .from(schema.users)
+              .where(eq(schema.users.id, Number(session.userId)))
+              .get();
+            if (user?.status === "active") return;
+            throw new APIError(
+              "UNAUTHORIZED",
+              context?.path === "/sign-in/username"
+                ? { message: "Invalid username or password", code: "INVALID_USERNAME_OR_PASSWORD" }
+                : { message: "Invalid email or password", code: "INVALID_EMAIL_OR_PASSWORD" }
+            );
+          },
           after: async (session) => {
             try {
               const { createAuditEvent } = await import("./models/audit");

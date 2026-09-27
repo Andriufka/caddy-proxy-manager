@@ -16,6 +16,7 @@ let db: TestDb;
 vi.mock('../../src/lib/db', () => ({
   get default() { return db; },
   get sqlite() { return undefined; },
+  purgeDeletedDatabaseContent: () => false,
   nowIso: () => new Date().toISOString(),
   toIso: (value: string | Date | null | undefined): string | null => {
     if (!value) return null;

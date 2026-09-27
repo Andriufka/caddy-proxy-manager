@@ -381,6 +381,87 @@ describe('identity-header strip leaves client credentials alone', () => {
   });
 });
 
+/** The header deletions the 2xx branch runs when the auth response lacks the header. */
+function removalsWithoutAuthValue(handler: Handler): Array<{ del: string[]; matchKey: string }> {
+  const entries = handler.handle_response as Array<{ match?: { status_code?: number[] }; routes?: Handler[] }>;
+  const ok = entries.find((e) => e.match?.status_code?.includes(2));
+  const out: Array<{ del: string[]; matchKey: string }> = [];
+  for (const route of ok?.routes ?? []) {
+    const del = ((route.handle as Handler[] | undefined)?.[0]?.request as { delete?: string[] } | undefined)?.delete;
+    const vars = (route.match as Array<{ vars?: Record<string, string[]> }> | undefined)?.[0]?.vars;
+    if (del && vars) {
+      const [matchKey] = Object.keys(vars);
+      expect(vars[matchKey]).toEqual(['']);
+      out.push({ del, matchKey });
+    }
+  }
+  return out;
+}
+
+describe('credential copy headers the auth server does not return', () => {
+  it('removes the client value on protected routes after the generic auth request', async () => {
+    await createProxyHost(
+      {
+        name: 'fa-cred-rm',
+        domains: ['fa-cred-rm.example.com'],
+        upstreams: [UPSTREAM],
+        forwardAuth: {
+          enabled: true,
+          provider: 'custom',
+          authUpstream: 'http://auth.example.com:9091',
+          authEndpoint: '/verify',
+          copyHeaders: ['Remote-User', 'Authorization', 'Proxy_Authorization'],
+        },
+      },
+      1
+    );
+    const [auth] = authSubrequestHandlers(await buildCaddyDocument());
+    expect(removalsWithoutAuthValue(auth)).toEqual([
+      { del: ['Authorization'], matchKey: '{http.reverse_proxy.header.Authorization}' },
+      {
+        del: expect.arrayContaining(['Proxy_Authorization', 'Proxy-Authorization']),
+        matchKey: '{http.reverse_proxy.header.Proxy_authorization}',
+      },
+    ]);
+  });
+
+  it('removes the client value after the Authentik outpost request', async () => {
+    await createProxyHost(
+      {
+        name: 'ak-cred-rm',
+        domains: ['ak-cred-rm.example.com'],
+        upstreams: [UPSTREAM],
+        authentik: { ...authentikBase, copyHeaders: [...AUTHENTIK_HEADERS, 'Cookie'] },
+      },
+      1
+    );
+    const [outpost] = authSubrequestHandlers(await buildCaddyDocument());
+    expect(removalsWithoutAuthValue(outpost)).toEqual([
+      { del: ['Cookie'], matchKey: '{http.reverse_proxy.header.Cookie}' },
+    ]);
+  });
+
+  it('removes nothing when no credential header is copied', async () => {
+    await createProxyHost(
+      {
+        name: 'fa-no-cred',
+        domains: ['fa-no-cred.example.com'],
+        upstreams: [UPSTREAM],
+        forwardAuth: {
+          enabled: true,
+          provider: 'custom',
+          authUpstream: 'http://auth.example.com:9091',
+          authEndpoint: '/verify',
+          copyHeaders: ['Remote-User'],
+        },
+      },
+      1
+    );
+    const [auth] = authSubrequestHandlers(await buildCaddyDocument());
+    expect(removalsWithoutAuthValue(auth)).toEqual([]);
+  });
+});
+
 describe('identity-header strip covers underscore spellings', () => {
   it('deletes the underscore form of every CPM identity header', async () => {
     await createProxyHost(

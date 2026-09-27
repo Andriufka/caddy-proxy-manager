@@ -697,10 +697,15 @@ function warnDroppedBySource(
   source: string | WafDirectiveSource,
   dropped: (DroppedWafDirective & { index: number })[]
 ): void {
-  if (typeof source === 'string') {
-    warnDroppedDirectives(source, dropped);
-    return;
-  }
+  for (const [name, lines] of droppedBySource(source, dropped)) warnDroppedDirectives(name, lines);
+}
+
+/** The dropped lines grouped under the source warnDroppedBySource names. */
+function droppedBySource(
+  source: string | WafDirectiveSource,
+  dropped: (DroppedWafDirective & { index: number })[]
+): [string, DroppedWafDirective[]][] {
+  if (typeof source === 'string') return dropped.length > 0 ? [[source, dropped]] : [];
   const globalLines = source.globalDirectives ? source.globalDirectives.split('\n').length : 0;
   const droppedByGlobal = new Set(
     filterDirectiveLines(source.globalDirectives, { crsLoaded: source.globalCrsLoaded }).dropped.map(({ index }) => index)
@@ -713,9 +718,7 @@ function warnDroppedBySource(
     ],
     [source.label, dropped.filter(({ index }) => index >= globalLines)],
   ];
-  for (const [name, lines] of bySource) {
-    if (lines.length > 0) warnDroppedDirectives(name, lines);
-  }
+  return bySource.filter(([, lines]) => lines.length > 0);
 }
 
 /**
@@ -828,6 +831,40 @@ export function wafDirectiveSource(
     globalDirectives: resolveWaf(global, host)?.globalDirectives ?? null,
     globalCrsLoaded: Boolean(global?.load_owasp_crs),
   };
+}
+
+/** A stored custom directive line that the generated config leaves out. */
+export interface DroppedWafDirectiveReport extends DroppedWafDirective {
+  source: string;
+}
+
+/**
+ * The stored custom directive lines that the WAF handlers built from these
+ * settings leave out, under the source buildWafHandler's warning names. Save
+ * validation refuses such lines, but stored values can predate a rule, and a
+ * left-out deny rule (or a SecDefaultAction that later `block` rules rely on)
+ * no longer blocks anything, so the WAF page lists them.
+ */
+export function listDroppedWafDirectives(
+  global: WafSettings | null,
+  hosts: readonly { name: string; domains: readonly string[]; waf?: WafHostConfig | null }[]
+): DroppedWafDirectiveReport[] {
+  const reports = new Map<string, DroppedWafDirectiveReport>();
+  const collect = (waf: WafSettings | null, source: string | WafDirectiveSource) => {
+    if (!waf?.enabled || waf.mode === 'Off') return;
+    const { dropped } = filterDirectiveLines(waf.custom_directives, { crsLoaded: Boolean(waf.load_owasp_crs) });
+    for (const [name, lines] of droppedBySource(source, dropped)) {
+      for (const { line, reason } of lines) reports.set(`${name}\n${line}\n${reason}`, { source: name, line, reason });
+    }
+  };
+  collect(global, GLOBAL_WAF_SOURCE);
+  for (const host of hosts) {
+    collect(
+      resolveEffectiveWaf(global, host.waf),
+      wafDirectiveSource(global, host.waf, `proxy host "${host.name}" (${host.domains.join(", ")})`)
+    );
+  }
+  return [...reports.values()];
 }
 
 /**

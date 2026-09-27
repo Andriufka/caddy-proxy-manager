@@ -726,6 +726,46 @@ function slaveSyncUrl(baseUrl: string): string {
 }
 
 /**
+ * Largest slave reply the master reads. Both replies are small JSON (an
+ * acknowledgement, or a key with at most MAX_SYNC_KEY_ROTATION_PROOFS proofs);
+ * without a limit, a slave or whoever answers at its URL could stream until
+ * the master runs out of memory.
+ */
+const MAX_SLAVE_REPLY_BYTES = 64 * 1024;
+
+/**
+ * The JSON body of a slave's reply, or null when it is not JSON or is larger
+ * than MAX_SLAVE_REPLY_BYTES (the rest is not read). A timeout is rethrown.
+ */
+async function readSlaveReplyJson(response: Response): Promise<unknown> {
+  try {
+    const declared = Number(response.headers.get("content-length"));
+    if (Number.isFinite(declared) && declared > MAX_SLAVE_REPLY_BYTES) {
+      await response.body?.cancel().catch(() => {});
+      return null;
+    }
+    if (!response.body) return null;
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_SLAVE_REPLY_BYTES) {
+        await reader.cancel().catch(() => {});
+        return null;
+      }
+      chunks.push(value);
+    }
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch (error) {
+    if (isTimeoutError(error)) throw error;
+    return null;
+  }
+}
+
+/**
  * Fetch a slave's sync public key and a nonce, with the safeguards of the
  * sync POST (no redirects, bounded in time, fixed error messages), sending
  * `challenge` for the slave's rotation proofs. A slave from an older release
@@ -757,10 +797,7 @@ async function fetchSlaveSyncKey(
     if (response.status < 200 || response.status >= 300) {
       return { ok: false, error: `Sync key request failed with HTTP ${response.status}`, status: response.status };
     }
-    const body = await response.json().catch((error: unknown) => {
-      if (isTimeoutError(error)) throw error;
-      return null;
-    });
+    const body = await readSlaveReplyJson(response);
     const key = parseSyncPublicKeyResponse(body);
     return key
       ? { ok: true, key, rotationProofs: parseSyncKeyRotationProofs(body) }
@@ -796,10 +833,7 @@ async function postSyncPayload(
     if (response.status < 200 || response.status >= 300) {
       return { ok: false, error: `Sync failed with HTTP ${response.status}`, status: response.status };
     }
-    const body = await response.json().catch((error: unknown) => {
-      if (isTimeoutError(error)) throw error;
-      return null;
-    }) as { ok?: unknown } | null;
+    const body = await readSlaveReplyJson(response) as { ok?: unknown } | null;
     return body?.ok === true
       ? { ok: true }
       : { ok: false, error: SYNC_NOT_ACKNOWLEDGED_ERROR, status: response.status };

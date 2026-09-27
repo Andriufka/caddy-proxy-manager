@@ -181,7 +181,8 @@ describe('self-registration usernames', () => {
 
     const boss = await apiError(signUp({ email: 'Boss@Example.com' }));
 
-    expect(boss).toEqual({ statusCode: 400, message: 'Another account signs in with this email address as its username' });
+    // The reply an existing email address gets, so it does not tell a username from an address.
+    expect(boss).toEqual({ statusCode: 422, message: 'User already exists. Use another email.' });
     expect(userCount('boss@example.com')).toBe(0);
   });
 
@@ -200,8 +201,8 @@ describe('self-registration usernames', () => {
 
     await app.userModel.createUser({ email: 'pat@example.com', provider: 'credentials', subject: 'pat', username: 'boss2@example.com' });
     const conflict = await post({ email: 'boss2@example.com' });
-    expect(conflict.status).toBe(400);
-    expect((await conflict.json()).message).toBe('Another account signs in with this email address as its username');
+    expect(conflict.status).toBe(422);
+    expect((await conflict.json()).message).toBe('User already exists. Use another email.');
   });
 });
 
@@ -230,8 +231,59 @@ describe('accounts Better Auth creates outside self-registration (OAuth sign-up)
       .rejects.toThrow('Another account signs in with this email address as its username');
     // The forward-auth portal would read "ops" as ops@localhost.
     await expect(adapter.createUser({ email: 'ops@localhost', name: 'Ops', emailVerified: false }))
-      .rejects.toThrow('Another account signs in with the name before @localhost as its username');
+      .rejects.toThrow('Email address is not allowed');
     expect(userCount('chief@example.com')).toBe(0);
     expect(userCount('ops@localhost')).toBe(0);
+  });
+
+  it('refuses an identity provider "email" that would claim a name nobody holds yet', async () => {
+    const adapter = await internalAdapter();
+    for (const email of ['root', 'newbie@localhost', 'Newbie@LOCALHOST', '@example.com', 'x@']) {
+      await expect(adapter.createUser({ email, name: 'X', emailVerified: false })).rejects.toThrow('Email address is not allowed');
+      expect(userCount(email.toLowerCase())).toBe(0);
+    }
+  });
+});
+
+describe('disabled accounts', () => {
+  it('get no session, and a correct password is refused as a wrong one', async () => {
+    const signedUp = await signUp({ email: 'dora@example.com' });
+    const userId = Number(signedUp.user!.id);
+    const { db, schema } = app;
+    expect(db.select().from(schema.sessions).where(eq(schema.sessions.userId, userId)).all().length).toBeGreaterThan(0);
+
+    await app.userModel.updateUserStatus(userId, 'disabled');
+    // Disabling ends the sessions the account has.
+    expect(db.select().from(schema.sessions).where(eq(schema.sessions.userId, userId)).all()).toEqual([]);
+
+    const signInWith = (password: string) => apiError(api('signInUsername')({ body: { username: 'dora@example.com', password } }));
+    const wrong = await signInWith(`${PASSWORD}-wrong`);
+    expect(await signInWith(PASSWORD)).toEqual(wrong);
+    expect(wrong).toEqual({ statusCode: 401, message: 'Invalid username or password' });
+    expect(await apiError(api('signInEmail')({ body: { email: 'dora@example.com', password: PASSWORD } })))
+      .toEqual({ statusCode: 401, message: 'Invalid email or password' });
+    expect(db.select().from(schema.sessions).where(eq(schema.sessions.userId, userId)).all()).toEqual([]);
+
+    await app.userModel.updateUserStatus(userId, 'active');
+    expect(await signIn('dora@example.com', PASSWORD)).toBe(String(userId));
+  });
+});
+
+describe('a username given to another account while Better Auth creates the user', () => {
+  it('is taken back from the new account, not from the other one', async () => {
+    const signedUp = await signUp({ email: 'race@example.com' });
+    const other = await app.userModel.createUser({ email: 'other-race@example.com', provider: 'credentials', subject: 'o' });
+    const { db, schema } = app;
+    // What an administrator's edit between the check and Better Auth's insert leaves.
+    db.update(schema.users).set({ username: 'race@example.com' }).where(eq(schema.users.id, other.id)).run();
+
+    app.userModel.releaseContestedSignInUsername(Number(signedUp.user!.id));
+
+    expect(storedUsername(signedUp.user!.id!)?.username).toBeNull();
+    expect(storedUsername(other.id)?.username).toBe('race@example.com');
+    // Nothing contested: nothing changes.
+    const alone = await signUp({ email: 'alone@example.com' });
+    app.userModel.releaseContestedSignInUsername(Number(alone.user!.id));
+    expect(storedUsername(alone.user!.id!)?.username).toBe('alone@example.com');
   });
 });

@@ -5,6 +5,7 @@ import { listWafEvents, countWafEvents, getWafEventStats, getWafRuleMessages } f
 import { getWafSettings } from "@/src/lib/settings";
 import { listProxyHosts } from "@/src/lib/models/proxy-hosts";
 import { requireAdmin } from "@/src/lib/auth";
+import { listDroppedWafDirectives } from "@/src/lib/caddy-waf";
 
 const PER_PAGE = 50;
 const RANGE_SECONDS = {
@@ -80,6 +81,7 @@ export default async function WafPage({ searchParams }: PageProps) {
       globalWafEnabled={globalWaf?.enabled ?? false}
       hostWafMap={hostWafMap}
       globalWaf={globalWaf ?? null}
+      droppedDirectives={listDroppedWafDirectives(globalWaf ?? null, hosts)}
     />
   );
 }

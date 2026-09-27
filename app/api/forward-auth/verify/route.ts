@@ -63,11 +63,16 @@ export async function GET(request: NextRequest) {
   const userGroups = await getGroupsForUser(session.userId);
   const groupNames = userGroups.map((g) => g.name).join(",");
 
-  // Return 200 with user info headers that Caddy will copy to upstream
+  // Return 200 with user info headers that Caddy will copy to upstream.
+  // X-CPM-User is the sign-in username, or the email address for an account
+  // without one: no other account can hold either (see sign-in-names.ts).
+  // The display name is not unique, since users, OAuth providers and
+  // ADMIN_USERNAME choose it, so an upstream trusting it could be told one
+  // user is another.
   return new NextResponse(null, {
     status: 200,
     headers: {
-      "X-CPM-User": user.name ?? user.email.split("@")[0],
+      "X-CPM-User": user.username ?? user.email,
       "X-CPM-Email": user.email,
       "X-CPM-Groups": groupNames,
       "X-CPM-User-Id": String(user.id)

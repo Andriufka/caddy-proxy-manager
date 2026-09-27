@@ -238,6 +238,51 @@ describe('stored WAF event redaction', () => {
   });
 });
 
+describe('stored WAF event redaction — credential names beyond the fixed header list', () => {
+  function stored(uri: string, headers: Record<string, string[]>, data: string) {
+    const line = JSON.stringify({
+      transaction: {
+        id: 'tx-names',
+        client_ip: '1.2.3.4',
+        is_interrupted: true,
+        request: { method: 'POST', uri, headers: { host: ['example.com'], ...headers } },
+      },
+      messages: [{ error_message: `[id "942100"] [msg "SQLi"] [data "${data}"] [severity "CRITICAL"]` }],
+    });
+    const row = parseLine(line, new Map())!;
+    const entry = JSON.parse(row.raw_data ?? '{}');
+    return { row, entry, data: extractBracketField(entry.messages[0].error_message, 'data') };
+  }
+
+  it('redacts credential query parameters in the stored URI, keeping the others', () => {
+    const { row, entry } = stored('/feed?q=1%27--&api_key=K1&accessToken=T1&X-Plex-Token=P1&page=2', {}, 'x');
+    const expected = '/feed?q=1%27--&api_key=[redacted]&accessToken=[redacted]&X-Plex-Token=[redacted]&page=2';
+    expect(row.uri).toBe(expected);
+    expect(entry.transaction.request.uri).toBe(expected);
+    expect(row.raw_data).not.toMatch(/K1|T1|P1/);
+  });
+
+  it('redacts headers whose names contain a credential word', () => {
+    const { entry } = stored('/', { 'X-Access-Token': ['T2'], 'X-Gitea-Api-Key': ['K2'], accept: ['*/*'] }, 'x');
+    expect(entry.transaction.request.headers['X-Access-Token']).toEqual(['[redacted]']);
+    expect(entry.transaction.request.headers['X-Gitea-Api-Key']).toEqual(['[redacted]']);
+    expect(entry.transaction.request.headers.accept).toEqual(['*/*']);
+  });
+
+  it('redacts form fields and query parameters with credential names that rule messages echo', () => {
+    expect(stored('/', {}, "Matched Data: ' or 1=1 found within ARGS:password: ' or 1=1--hunter2").data)
+      .toBe('Matched Data: [redacted] found within ARGS:password: [redacted]');
+    expect(stored('/', {}, 'ARGS_POST:client_secret=abc--').data).toBe('ARGS_POST:client_secret=[redacted]');
+    expect(stored('/', {}, "Matched Data: ' or 1=1 found within ARGS:q: ' or 1=1").data)
+      .toBe("Matched Data: ' or 1=1 found within ARGS:q: ' or 1=1");
+  });
+
+  it('redacts credential query parameters inside an echoed request URI', () => {
+    expect(stored('/', {}, "Matched Data: union found within REQUEST_URI: /x?token=S3&q=union").data)
+      .toBe('Matched Data: union found within REQUEST_URI: /x?token=[redacted]&q=union');
+  });
+});
+
 // With audit part H, Coraza writes each matched rule's ModSecurity-format
 // string to messages[].error_message; CRS logdata echoes the matched value
 // ("Matched Data: … found within REQUEST_COOKIES:<name>: <value>"). When a

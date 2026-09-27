@@ -490,7 +490,9 @@ export default function OAuthProvidersSection({ initialProviders, baseUrl }: OAu
               </Label>
             </div>
             <p className="text-xs text-muted-foreground -mt-1">
-              Automatically link OAuth accounts to existing users with the same email address.
+              Automatically link OAuth accounts to existing users with the same email address, whether or not
+              the provider has verified it. Only enable it for a provider where users cannot set an email
+              address they do not own.
             </p>
 
             {editingProvider && (

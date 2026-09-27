@@ -93,6 +93,11 @@ export const sqlite =
     ensureDirectoryFor(sqlitePath);
     const client = new Database(sqlitePath);
     restrictDatabaseFileModes(sqlitePath);
+    // Overwrite deleted and replaced content with zeros instead of leaving it
+    // in free pages and page slack, where secrets encrypted or removed after
+    // the fact (legacy plaintext keys and tokens) could be read back from
+    // the file or a copy of it.
+    client.exec("PRAGMA secure_delete = ON");
     return client;
   })();
 
@@ -694,6 +699,35 @@ try {
   runOAuthIdentityRepair();
 } catch (error) {
   console.warn("Better Auth data migration warning:", error);
+}
+
+/**
+ * PRAGMA user_version once the database has been vacuumed with secure_delete
+ * on. Nothing else in CPM uses user_version.
+ */
+const SECURE_DELETE_VACUUM_VERSION = 1;
+
+/**
+ * VACUUMs the database, which rebuilds the file without the free pages and
+ * page slack that secure_delete does not reach: content deleted or replaced
+ * before it was on. Runs when `force` is set (a startup migration just
+ * rewrote secrets) and once on a database that was never vacuumed this way.
+ * Returns whether it ran; failures (VACUUM needs room for a copy of the
+ * database) are logged and leave the database as it was.
+ */
+export function purgeDeletedDatabaseContent(force = false): boolean {
+  if (sqlitePath === ":memory:") return false;
+  try {
+    const row = sqlite.prepare("PRAGMA user_version").get() as { user_version?: number } | null;
+    const version = row?.user_version ?? 0;
+    if (!force && version >= SECURE_DELETE_VACUUM_VERSION) return false;
+    sqlite.exec("VACUUM");
+    if (version < SECURE_DELETE_VACUUM_VERSION) sqlite.exec(`PRAGMA user_version = ${SECURE_DELETE_VACUUM_VERSION}`);
+    return true;
+  } catch (error) {
+    console.error("Failed to VACUUM the database; deleted content may remain in its free pages:", error);
+    return false;
+  }
 }
 
 export { schema };

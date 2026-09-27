@@ -7,6 +7,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
+import { eq } from 'drizzle-orm';
 import type { TestDb } from '../helpers/db';
 
 const ctx = vi.hoisted(() => ({ db: null as unknown as TestDb }));
@@ -503,6 +504,32 @@ describe('verify endpoint portal target', () => {
     }));
     expect(forbidden.status).toBe(403);
     expect(forbidden.headers.get(FORWARD_AUTH_PORTAL_TARGET_HEADER)).toBe('https://private.example.com/admin');
+  });
+
+  it('names the user by sign-in username or email, never by the display name others can share', async () => {
+    const { user, host } = await setupAuthorizedWildcard();
+    const verifiedHeaders = async () => {
+      const { rawCode, audience } = await createCode(user.id, 'https://private.example.com/');
+      const redeemed = await redeemExchangeCode(rawCode, audience);
+      const response = await forwardAuthVerify(verifyRequest({
+        ...proxyHeaders('https://private.example.com', undefined, host.id),
+        'x-forwarded-uri': '/',
+        cookie: `_cpm_fa=${redeemed!.rawSessionToken}`,
+      }));
+      expect(response.status).toBe(200);
+      return response.headers;
+    };
+
+    // Display name "admin", as anyone can pick; no username: the email address.
+    await ctx.db.update(schema.users).set({ name: 'admin' }).where(eq(schema.users.id, user.id));
+    let headers = await verifiedHeaders();
+    expect(headers.get('X-CPM-User')).toBe('alice@localhost');
+    expect(headers.get('X-CPM-User-Id')).toBe(String(user.id));
+
+    await ctx.db.update(schema.users).set({ username: 'alice' }).where(eq(schema.users.id, user.id));
+    headers = await verifiedHeaders();
+    expect(headers.get('X-CPM-User')).toBe('alice');
+    expect(headers.get('X-CPM-Email')).toBe('alice@localhost');
   });
 
   it('sends no target without the proxy proof or for a non origin-form URI', async () => {

@@ -489,6 +489,28 @@ describe('syncInstances transport', () => {
     fetchSpy.mockRestore();
   });
 
+  it('stops reading a slave reply past 64 KiB, declared or streamed', async () => {
+    await addSlave();
+    // Declared too large: refused without reading the body.
+    let reply: Reply = () => Response.json({ ok: true, padding: 'x'.repeat(70 * 1024) });
+    const fetchSpy = stubSlave(() => reply());
+    expect(await syncInstances()).toMatchObject({ success: 0, failed: 1 });
+    expect((await listInstances())[0].lastSyncError).toBe('Slave did not acknowledge the sync (unexpected response)');
+
+    // Streamed without a length and without end: the read stops at the limit.
+    let pulls = 0;
+    reply = () => new Response(new ReadableStream({
+      pull(controller) {
+        pulls++;
+        controller.enqueue(new Uint8Array(16 * 1024).fill(0x20));
+      },
+    }), { status: 200 });
+    expect(await syncInstances()).toMatchObject({ success: 0, failed: 1 });
+    expect(pulls).toBeLessThan(16);
+    expect((await listInstances())[0].lastSyncError).toBe('Slave did not acknowledge the sync (unexpected response)');
+    fetchSpy.mockRestore();
+  });
+
   it.each(['GET', 'POST'])('records a timed-out %s request as "Sync timed out"', async (method) => {
     await addSlave();
     let failure: Error = timeoutError();

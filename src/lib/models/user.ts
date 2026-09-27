@@ -132,14 +132,7 @@ export async function createUser(data: {
 }): Promise<User> {
   const now = nowIso();
   const role = data.role ?? "user";
-  // The address is stored lowercased, so lowercasing must not turn it into another one.
-  if (lowercasesIntoAscii(data.email)) {
-    throw new ApiValidationError(
-      "Email address contains a character that lowercasing turns into an ASCII letter (such as the Kelvin sign); " +
-      "enter it with plain letters"
-    );
-  }
-  const email = data.email.trim().toLowerCase();
+  const email = storedEmail(data.email);
   const provider = data.provider === "credential" ? "credentials" : data.provider;
 
   // One synchronous transaction, so no other account can take the email
@@ -190,6 +183,22 @@ export async function createUser(data: {
 type DbTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
 /**
+ * `email` as it is stored: trimmed and lowercased. The address is compared
+ * lowercased everywhere, so lowercasing must not turn it into another one.
+ */
+function storedEmail(email: string): string {
+  if (lowercasesIntoAscii(email)) {
+    throw new ApiValidationError(
+      "Email address contains a character that lowercasing turns into an ASCII letter (such as the Kelvin sign); " +
+      "enter it with plain letters"
+    );
+  }
+  const stored = email.trim().toLowerCase();
+  if (!stored) throw new ApiValidationError("Email address is required");
+  return stored;
+}
+
+/**
  * A username an administrator chose that the account cannot have. The message
  * says why and is safe to show; the REST API answers it with 400.
  */
@@ -233,8 +242,9 @@ function writeUserChanges(
 ): { row: DbUser; previousUsername: string | null } | null {
   const current = tx.select().from(users).where(eq(users.id, userId)).get();
   if (!current) return null;
-  if (data.email !== undefined && data.email.toLowerCase() !== current.email.toLowerCase()) {
-    const conflict = signInEmailConflict(tx, userId, data.email);
+  const email = data.email === undefined ? current.email : storedEmail(data.email);
+  if (email !== current.email.toLowerCase()) {
+    const conflict = signInEmailConflict(tx, userId, email);
     if (conflict) throw new ApiValidationError(conflict);
   }
   // The username the user has is no change, so the other fields can be edited
@@ -245,7 +255,7 @@ function writeUserChanges(
   const row = tx
     .update(users)
     .set({
-      email: data.email ?? current.email,
+      email,
       name: data.name ?? current.name,
       avatarUrl: data.avatarUrl ?? current.avatarUrl,
       // displayUsername follows, as Better Auth stores it when a username changes.
@@ -304,17 +314,42 @@ export async function setUserSignInUsername(
  * request asked for: CPM stores no other username than that or one an
  * administrator sets. Any other account (an OAuth sign-up) gets none until its
  * password is set (see writeUserPassword).
+ *
+ * The address must look like one outside CPM's own names: an identity
+ * provider can assert any "email", and one without an '@' (such as "root")
+ * or a @localhost one (a forward-auth portal name) would otherwise claim a
+ * sign-in name that only an administrator may give out.
  */
 export function applySignInNameRules<T extends Record<string, unknown>>(
   user: T,
   selfRegistered: boolean
 ): T & { username: string | null } {
   const email = typeof user.email === "string" ? user.email : "";
+  const at = email.lastIndexOf("@");
+  if (at <= 0 || at === email.length - 1 || email.toLowerCase().endsWith(PORTAL_EMAIL_DOMAIN)) {
+    throw new ApiValidationError("Email address is not allowed");
+  }
   const conflict = signInEmailConflict(db, null, email);
   if (conflict) throw new ApiValidationError(conflict);
   if (!selfRegistered) return { ...user, username: null };
   const username = ownEmailUsername(db, null, email);
   return { ...user, username, displayUsername: username };
+}
+
+/**
+ * Run after Better Auth has inserted user `userId`. applySignInNameRules
+ * checked the username before the insert, but Better Auth writes the row
+ * later and asynchronously, so an administrator may have given the name to
+ * another account in between (the column has no unique index). The new
+ * account then loses it: the name was only the one CPM gives by itself, and
+ * an administrator can set another.
+ */
+export function releaseContestedSignInUsername(userId: number): void {
+  db.transaction((tx) => {
+    const row = tx.select({ username: users.username }).from(users).where(eq(users.id, userId)).get();
+    if (!row?.username || !isSignInNameTaken(tx, userId, row.username.toLowerCase())) return;
+    tx.update(users).set({ username: null, updatedAt: nowIso() }).where(eq(users.id, userId)).run();
+  });
 }
 
 export type SignInUsernameReview = { userId: number; username: string; reason: "shared" | "other-address" };
@@ -620,8 +655,10 @@ export async function updateUserStatus(userId: number, status: string): Promise<
     .where(eq(users.id, userId))
     .returning();
 
-  // Revoke all forward auth sessions when user is deactivated
+  // Revoke all sessions when user is deactivated: CPM's own routes refuse a
+  // disabled user's session, but Better Auth's endpoints would still take it.
   if (status !== "active") {
+    await db.delete(sessions).where(eq(sessions.userId, userId));
     await deleteUserForwardAuthSessions(userId);
   }
 

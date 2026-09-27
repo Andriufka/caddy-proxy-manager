@@ -44,9 +44,13 @@ export async function register() {
 
     // Imported keys and provider options could contain plaintext secrets in
     // older releases. Repair them before any request handler reads the rows.
+    // Whether a migration below rewrote stored secrets, leaving their old
+    // (plaintext) bytes behind for purgeDeletedDatabaseContent.
+    let rewroteSecrets = false;
     const { migrateLegacyCertificateStorage } = await import("./lib/models/certificates");
     try {
       const migrated = await migrateLegacyCertificateStorage();
+      rewroteSecrets ||= migrated > 0;
       if (migrated > 0) {
         console.log(`Hardened ${migrated} legacy certificate record(s)`);
       }
@@ -58,6 +62,7 @@ export async function register() {
     const { migrateLegacyCaPrivateKeys } = await import("./lib/models/ca-certificates");
     try {
       const migrated = await migrateLegacyCaPrivateKeys();
+      rewroteSecrets ||= migrated > 0;
       if (migrated > 0) {
         console.log(`Encrypted ${migrated} legacy CA private key(s)`);
       }
@@ -73,6 +78,7 @@ export async function register() {
     const { reencryptStoredSecrets } = await import("./lib/secret-rotation");
     try {
       const { reencrypted, encryptedPlaintext, failed, clearedOAuthTokens } = await reencryptStoredSecrets();
+      rewroteSecrets ||= reencrypted > 0 || encryptedPlaintext > 0 || clearedOAuthTokens > 0;
       if (reencrypted > 0) {
         console.log(`Re-encrypted ${reencrypted} stored secret(s) with the current SESSION_SECRET`);
       }
@@ -94,6 +100,14 @@ export async function register() {
     } catch (error) {
       // Values that were not re-encrypted still decrypt with the fallback keys.
       console.error("Failed to re-encrypt stored secrets:", error);
+    }
+
+    // secure_delete only covers what is deleted from now on; VACUUM drops the
+    // old plaintext the migrations above (or earlier releases) left in the
+    // database file.
+    const { purgeDeletedDatabaseContent } = await import("./lib/db");
+    if (purgeDeletedDatabaseContent(rewroteSecrets)) {
+      console.log("Vacuumed the database so deleted and replaced secrets no longer remain in it");
     }
 
     // Apply Caddy configuration from database on startup

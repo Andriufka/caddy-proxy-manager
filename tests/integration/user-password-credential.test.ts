@@ -653,9 +653,16 @@ describe('updateUserProfile', () => {
     expect(await getUserById(userId)).toMatchObject({ email: 'ben@example.com', name: 'ben@example.com' });
   });
 
-  it('allows a new case of the email address the user has', async () => {
+  it('stores a new email address trimmed and lowercased, as creating a user does', async () => {
     const userId = await seedUser('ben@example.com', 'hash', 'ben@example.com');
-    expect((await updateUserProfile(userId, { email: 'Ben@Example.com' }))?.email).toBe('Ben@Example.com');
+    expect((await updateUserProfile(userId, { email: ' Ben@Example.com ' }))?.email).toBe('ben@example.com');
+    expect((await updateUserProfile(userId, { email: 'Ben.New@Example.com' }))?.email).toBe('ben.new@example.com');
+  });
+
+  it('refuses an email address that lowercasing turns into another one', async () => {
+    const userId = await seedUser('ben@example.com', 'hash', 'ben@example.com');
+    await expect(updateUserProfile(userId, { email: 'ben@\u212Aelvin.example' })).rejects.toThrow(/Kelvin sign/);
+    expect((await updateUserProfile(userId, {}))?.email).toBe('ben@example.com');
   });
 
   it('keeps a username that works when the email changes', async () => {

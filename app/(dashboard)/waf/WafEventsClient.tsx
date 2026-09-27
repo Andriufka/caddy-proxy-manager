@@ -26,6 +26,7 @@ import { cn } from "@/lib/utils";
 import { DataTable } from "@/components/ui/DataTable";
 import type { WafEvent, WafEventStats } from "@/lib/models/waf-events";
 import type { WafSettings } from "@/lib/settings";
+import type { DroppedWafDirectiveReport } from "@/lib/caddy-waf";
 import {
   suppressWafRuleGloballyAction,
   suppressWafRuleForHostAction,
@@ -47,6 +48,7 @@ type Props = {
   globalWafEnabled: boolean;
   hostWafMap: Record<string, number[]>;
   globalWaf: WafSettings | null;
+  droppedDirectives: DroppedWafDirectiveReport[];
 };
 
 type RangeOption = Props['initialRange'];
@@ -738,7 +740,7 @@ function GlobalSuppressedRules({
 }
 
 /* ── Main client component ───────────────────────────────────────────────── */
-export default function WafEventsClient({ events, stats, pagination, initialSearch, initialRange, initialFrom, initialTo, globalExcluded, globalExcludedMessages, globalWafEnabled, hostWafMap, globalWaf }: Props) {
+export default function WafEventsClient({ events, stats, pagination, initialSearch, initialRange, initialFrom, initialTo, globalExcluded, globalExcludedMessages, globalWafEnabled, hostWafMap, globalWaf, droppedDirectives }: Props) {
   const router       = useRouter();
   const pathname     = usePathname();
   const searchParams = useSearchParams();
@@ -930,6 +932,25 @@ export default function WafEventsClient({ events, stats, pagination, initialSear
     <div className="flex flex-col gap-4 w-full">
       <h1 className="text-3xl font-semibold">WAF</h1>
       <p className="text-muted-foreground">Web Application Firewall events and rule management.</p>
+
+      {droppedDirectives.length > 0 && (
+        <Alert variant="destructive">
+          <AlertDescription>
+            <p>
+              {droppedDirectives.length} stored custom directive line(s) are not sent to Caddy and have no effect.
+              A rule left out no longer blocks anything, and later <code>block</code> rules no longer follow a
+              SecDefaultAction left out. Rewrite or remove them:
+            </p>
+            <ul className="mt-2 list-disc pl-5 font-mono text-[0.78rem] break-all">
+              {droppedDirectives.map((d) => (
+                <li key={`${d.source}\n${d.line}\n${d.reason}`}>
+                  {d.source}: &quot;{d.line}&quot; → {d.reason}
+                </li>
+              ))}
+            </ul>
+          </AlertDescription>
+        </Alert>
+      )}
 
       <Tabs value={tab} onValueChange={(v) => { setTab(v); if (v !== "events") setSelected(null); }}>
         <TabsList>

@@ -7,6 +7,14 @@
  * CRS rules off does it with `ctl:ruleRemoveByTag` in phase 1: the removal
  * holds for the rest of the transaction, including the phase 2 anomaly-score
  * check (949110) that blocks.
+ *
+ * The path skip matches REQUEST_FILENAME, the path Go has already decoded
+ * once, and refuses any path containing "..": the raw REQUEST_URI of
+ * /api/../index.php or /api/%2e%2e/index.php starts with /api/, but Caddy
+ * forwards it as-is and an upstream that resolves dot-segments serves
+ * /index.php. No further decoding transformation is applied, so %252e stays
+ * %2e as the upstream sees it. Coraza compiles @rx with (?sm), so the pattern
+ * anchors with \A and \z: ^ and $ would also match at a decoded %0a.
  */
 export const WAF_QUICK_TEMPLATES: readonly { label: string; snippet: string }[] = [
   {
@@ -15,7 +23,7 @@ export const WAF_QUICK_TEMPLATES: readonly { label: string; snippet: string }[] 
   },
   {
     label: "Skip OWASP CRS for path",
-    snippet: `SecRule REQUEST_URI "@beginsWith /api/" "id:9001,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"`,
+    snippet: String.raw`SecRule REQUEST_FILENAME "@rx \A/api/(?:[^.]|\.[^.])*\.?\z" "id:9001,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"`,
   },
   {
     label: "Skip OWASP CRS XSS rules",

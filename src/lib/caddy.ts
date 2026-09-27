@@ -213,8 +213,9 @@ function authResponseHeaderPlaceholder(headerName: string): string {
  * Standard request-credential headers.  They carry the client's own
  * credentials, not an identity assertion, and excluded paths, access-list
  * basic auth and the auth server itself may need them, so the identity-header
- * strip leaves them alone.  On protected routes the copy step still overwrites
- * them whenever the auth server returns them.
+ * strip leaves them alone.  On protected routes, one listed as a copy header
+ * is replaced by the auth server's value, or removed when it returns none
+ * (see buildAuthResponseCopyRoutes).
  */
 const CLIENT_CREDENTIAL_HEADERS = new Set(["authorization", "proxy-authorization", "cookie"]);
 
@@ -260,6 +261,33 @@ function buildIdentityHeaderStripHandler(headerNames: readonly string[]): Record
     }
   }
   return names.size > 0 ? { handler: "headers", request: { delete: [...names.values()] } } : null;
+}
+
+/**
+ * The handle_response routes run on the original request after a 2xx auth
+ * response: each copy header is set from the auth response when that has a
+ * non-empty value. The client credential headers are exempt from the
+ * identity-header strip so the auth server receives them; one listed as a
+ * copy header is removed here when the auth server returns none, so an
+ * upstream relying on the header listed only ever gets the auth server's
+ * value, never one the client sent.
+ */
+function buildAuthResponseCopyRoutes(headerNames: readonly string[]): Record<string, unknown>[] {
+  const routes: Record<string, unknown>[] = [{ handle: [{ handler: "vars" }] }];
+  for (const headerName of headerNames) {
+    const placeholder = authResponseHeaderPlaceholder(headerName);
+    routes.push({
+      handle: [{ handler: "headers", request: { set: { [headerName]: [placeholder] } } }],
+      match: [{ not: [{ vars: { [placeholder]: [""] } }] }]
+    });
+    if (CLIENT_CREDENTIAL_HEADERS.has(headerName.toLowerCase().replace(/_/g, "-"))) {
+      routes.push({
+        handle: [{ handler: "headers", request: { delete: [...new Set(headerSeparatorSpellings(headerName))] } }],
+        match: [{ vars: { [placeholder]: [""] } }]
+      });
+    }
+  }
+  return routes;
 }
 
 type MtlsMeta = {
@@ -1293,39 +1321,7 @@ async function buildProxyRoutes(
 
     if (authentik) {
       // Build handle_response routes for copying headers on 2xx status
-      const handleResponseRoutes: Record<string, unknown>[] = [
-        {
-          handle: [{ handler: "vars" }]
-        }
-      ];
-
-      // Add header copying for each configured header
-      for (const headerName of authentik.copyHeaders) {
-        const placeholder = authResponseHeaderPlaceholder(headerName);
-        handleResponseRoutes.push({
-          handle: [
-            {
-              handler: "headers",
-              request: {
-                set: {
-                  [headerName]: [placeholder]
-                }
-              }
-            } as Record<string, unknown>
-          ],
-          match: [
-            {
-              not: [
-                {
-                  vars: {
-                    [placeholder]: [""]
-                  }
-                }
-              ]
-            }
-          ]
-        });
-      }
+      const handleResponseRoutes = buildAuthResponseCopyRoutes(authentik.copyHeaders);
 
       // Create the forward auth reverse_proxy handler
       // Convert "private_ranges" to actual CIDR blocks for JSON config
@@ -3329,35 +3325,7 @@ function parseForwardAuthConfig(meta: ForwardAuthMeta | undefined | null): Forwa
  * HTML login page.
  */
 function buildGenericForwardAuthHandler(cfg: ForwardAuthRouteConfig, api401: boolean): Record<string, unknown> {
-  const handleResponseRoutes: Record<string, unknown>[] = [
-    { handle: [{ handler: "vars" }] }
-  ];
-  for (const headerName of cfg.copyHeaders) {
-    const placeholder = authResponseHeaderPlaceholder(headerName);
-    handleResponseRoutes.push({
-      handle: [
-        {
-          handler: "headers",
-          request: {
-            set: {
-              [headerName]: [placeholder]
-            }
-          }
-        }
-      ],
-      match: [
-        {
-          not: [
-            {
-              vars: {
-                [placeholder]: [""]
-              }
-            }
-          ]
-        }
-      ]
-    });
-  }
+  const handleResponseRoutes = buildAuthResponseCopyRoutes(cfg.copyHeaders);
 
   const handleResponse: Record<string, unknown>[] = [
     {

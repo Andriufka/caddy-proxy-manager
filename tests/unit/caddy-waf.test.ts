@@ -19,6 +19,7 @@ import {
   filterCustomDirectives,
   findInvalidBodyLimitDirective,
   GLOBAL_WAF_SOURCE,
+  listDroppedWafDirectives,
   parseBodyLimitMib,
   resolveEffectiveWaf,
   wafDirectiveSource,
@@ -1195,7 +1196,7 @@ describe('WAF_QUICK_TEMPLATES', () => {
 
   it('switches CRS rules off per transaction instead of with rule-removal directives', () => {
     const byLabel = new Map(WAF_QUICK_TEMPLATES.map((t) => [t.label, t.snippet]));
-    expect(byLabel.get('Skip OWASP CRS for path')).toMatch(/"@beginsWith \/api\/".*phase:1,.*ctl:ruleRemoveByTag=OWASP_CRS/);
+    expect(byLabel.get('Skip OWASP CRS for path')).toMatch(/^SecRule REQUEST_FILENAME "@rx \\A\/api\/.*\\z" ".*phase:1,.*ctl:ruleRemoveByTag=OWASP_CRS"$/);
     expect(byLabel.get('Skip OWASP CRS XSS rules')).toMatch(/^SecAction ".*phase:1,.*ctl:ruleRemoveByTag=attack-xss"$/);
   });
 });
@@ -1208,5 +1209,36 @@ describe('droppedWafDirectiveMessage', () => {
     expect(msg).toMatch(/will be dropped and never sent to Caddy/);
     expect(msg).toMatch(/SecRuleUpdateActionById 930130 "block"/);
     expect(msg).toMatch(/rule-mutation/);
+  });
+});
+
+// Stored lines that predate a filter rule are left out of the config; a
+// left-out deny rule silently stops blocking, so the WAF page lists them.
+describe('listDroppedWafDirectives', () => {
+  const fromFile = 'SecRule REMOTE_ADDR "!@ipMatchFromFile /data/allow.txt" "id:9501,phase:1,deny,status:403"';
+  const kept = 'SecRule ARGS "@contains evil" "id:9502,deny"';
+
+  it('lists global and host lines under their source, once each', () => {
+    const global = { ...baseWaf, custom_directives: `${fromFile}\n${kept}` };
+    const hosts = [
+      { name: 'inherits', domains: ['a.example.com'], waf: null },
+      {
+        name: 'merged',
+        domains: ['b.example.com'],
+        waf: { enabled: true, waf_mode: 'merge' as const, custom_directives: 'SecAction "id:9601,phase:1,setenv:X=1"' },
+      },
+    ];
+    const reports = listDroppedWafDirectives(global, hosts);
+    expect(reports.map(({ source, line }) => [source, line])).toEqual([
+      [GLOBAL_WAF_SOURCE, fromFile],
+      ['proxy host "merged" (b.example.com)', 'SecAction "id:9601,phase:1,setenv:X=1"'],
+    ]);
+    expect(reports[0].reason).toMatch(/ipMatchFromFile/);
+  });
+
+  it('lists nothing for a WAF that is off or has only kept lines', () => {
+    expect(listDroppedWafDirectives({ ...baseWaf, enabled: false, custom_directives: fromFile }, [])).toEqual([]);
+    expect(listDroppedWafDirectives({ ...baseWaf, mode: 'Off', custom_directives: fromFile }, [])).toEqual([]);
+    expect(listDroppedWafDirectives({ ...baseWaf, custom_directives: kept }, [])).toEqual([]);
   });
 });

@@ -184,16 +184,77 @@ const CREDENTIAL_HEADERS = new Set([
 ]);
 const REDACTED = '[redacted]';
 
-// SecLang variables naming a credential: any cookie, or a credential header.
-// Rule logdata such as CRS's "Matched Data: %{TX.0} found within
-// %{MATCHED_VAR_NAME}: %{MATCHED_VAR}" echoes that variable's value.
-const COOKIE_VARIABLE_PREFIX = 'request_cookies:';
-const CREDENTIAL_HEADER_VARIABLES = [...CREDENTIAL_HEADERS].flatMap((name) => [
-  `request_headers:${name}`,
-  `response_headers:${name}`,
+// Words that make a header, query parameter or form field name a credential
+// one (X-Access-Token, api_key, accessToken, password, ...). The name is split
+// into words at non-alphanumerics and lower-to-upper case changes.
+const CREDENTIAL_NAME_WORDS = new Set([
+  'apikey',
+  'auth',
+  'authorization',
+  'code',
+  'credential',
+  'credentials',
+  'jwt',
+  'key',
+  'pass',
+  'passphrase',
+  'passwd',
+  'password',
+  'pwd',
+  'secret',
+  'session',
+  'sessionid',
+  'sid',
+  'sig',
+  'signature',
+  'token',
 ]);
+
+/** True when a header, query parameter or form field `name` carries a credential. */
+function isCredentialName(name: string): boolean {
+  if (CREDENTIAL_HEADERS.has(name.toLowerCase())) return true;
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .some((word) => CREDENTIAL_NAME_WORDS.has(word));
+}
+
+/**
+ * `uri` with the value of every credential-named query parameter replaced
+ * (see isCredentialName), e.g. /feed?token=abc&q=1 → /feed?token=[redacted]&q=1.
+ */
+function redactQueryString(uri: string): string {
+  const query = uri.indexOf('?');
+  if (query === -1) return uri;
+  const params = uri.slice(query + 1).split('&').map((param) => {
+    const separator = param.indexOf('=');
+    const rawName = separator === -1 ? param : param.slice(0, separator);
+    let name = rawName;
+    try {
+      name = decodeURIComponent(rawName.replace(/\+/g, ' '));
+    } catch {
+      // Keep the raw name when it is not valid percent-encoding.
+    }
+    return separator !== -1 && isCredentialName(name) ? `${rawName}=${REDACTED}` : param;
+  });
+  return `${uri.slice(0, query + 1)}${params.join('&')}`;
+}
+
+// SecLang variables naming a credential: any cookie, or a credential header,
+// query parameter or form field. Rule logdata such as CRS's "Matched Data:
+// %{TX.0} found within %{MATCHED_VAR_NAME}: %{MATCHED_VAR}" echoes that
+// variable's value.
+const COOKIE_VARIABLE_PREFIX = 'request_cookies:';
+const HEADER_VARIABLE_PREFIXES = ['request_headers:', 'response_headers:'];
+const ARGS_VARIABLE_PREFIXES = ['args:', 'args_get:', 'args_post:'];
+const CREDENTIAL_HEADER_VARIABLES = [...CREDENTIAL_HEADERS].flatMap((name) =>
+  HEADER_VARIABLE_PREFIXES.map((prefix) => `${prefix}${name}`)
+);
+// Variables whose value is the request URI or its query string.
+const URI_VARIABLES = new Set(['request_uri', 'request_uri_raw', 'request_line', 'query_string']);
 // Any text that could start one of them, for a quick skip.
-const CREDENTIAL_COLLECTION = /REQUEST_COOKIES:|(?:REQUEST|RESPONSE)_HEADERS:/i;
+const CREDENTIAL_COLLECTION = /REQUEST_COOKIES:|(?:REQUEST|RESPONSE)_HEADERS:|ARGS(?:_GET|_POST)?:|REQUEST_URI|REQUEST_LINE|QUERY_STRING/i;
 const MATCHED_DATA = 'Matched Data: ';
 const MATCHED_HEADER = 'Matched Data: Header ';
 const FOUND_WITHIN = ' found within ';
@@ -215,7 +276,7 @@ function redactHeaderMap(headers: unknown): unknown {
   return Object.fromEntries(
     Object.entries(headers as Record<string, unknown>).map(([name, value]) => [
       name,
-      CREDENTIAL_HEADERS.has(name.toLowerCase())
+      isCredentialName(name)
         ? (Array.isArray(value) ? value.map(() => REDACTED) : REDACTED)
         : value,
     ])
@@ -230,16 +291,22 @@ function carriesCredentials(entry: object): boolean {
     const headers = (tx as Record<string, { headers?: unknown } | undefined>)[part]?.headers;
     if (!headers || typeof headers !== 'object') return false;
     return Object.entries(headers).some(([name, value]) =>
-      CREDENTIAL_HEADERS.has(name.toLowerCase()) &&
+      isCredentialName(name) &&
       (Array.isArray(value) ? value.some((v) => Boolean(v)) : Boolean(value))
     );
   });
 }
 
-/** True when `name` is a cookie or credential header variable, e.g. `REQUEST_COOKIES:session`. */
+/**
+ * True when `name` is a cookie variable, or a header, query parameter or form
+ * field variable with a credential name, e.g. `REQUEST_COOKIES:session` or
+ * `ARGS:password`.
+ */
 function isCredentialVariable(name: string): boolean {
   const lower = name.toLowerCase();
-  return lower.startsWith(COOKIE_VARIABLE_PREFIX) || CREDENTIAL_HEADER_VARIABLES.includes(lower);
+  if (lower.startsWith(COOKIE_VARIABLE_PREFIX)) return true;
+  const prefix = [...HEADER_VARIABLE_PREFIXES, ...ARGS_VARIABLE_PREFIXES].find((p) => lower.startsWith(p));
+  return prefix !== undefined && isCredentialName(name.slice(prefix.length));
 }
 
 /** True when `text` is the start of a credential variable name cut short, e.g. `REQUEST_COO`. */
@@ -248,6 +315,20 @@ function isCredentialVariablePrefix(text: string): boolean {
   return [COOKIE_VARIABLE_PREFIX, ...CREDENTIAL_HEADER_VARIABLES].some(
     (name) => name.length > lower.length && name.startsWith(lower)
   );
+}
+
+/**
+ * True when `text` could be a query parameter or form field variable whose
+ * name was cut short (`ARGS:pass`): the whole name can't be judged.
+ */
+function isArgsVariablePrefix(text: string): boolean {
+  const lower = text.toLowerCase();
+  return ARGS_VARIABLE_PREFIXES.some((prefix) => lower.startsWith(prefix) || prefix.startsWith(lower));
+}
+
+/** `NAME: VALUE` with the query string of VALUE redacted when NAME is a URI variable. */
+function redactUriVariable(name: string, value: string): string | null {
+  return URI_VARIABLES.has(name.toLowerCase()) ? redactQueryString(value) : null;
 }
 
 function utf8Length(codePoint: number): number {
@@ -297,7 +378,9 @@ function goQuotedByteLength(quoted: string): number {
  * only the start of the matched value. When the transaction carried
  * credentials (`credentialed`), that excerpt is redacted if what is left of
  * NAME could be the start of a credential variable, or if no " found within "
- * is left at all in a capped text.
+ * is left at all in a capped text. A capped text ending in a query parameter
+ * or form field variable is redacted whatever the transaction carried, since
+ * the cap may have cut the name that makes it a credential one.
  */
 function redactCredentialText(text: string, credentialed: boolean, capped: boolean): string {
   if (!text.startsWith(MATCHED_DATA)) {
@@ -305,10 +388,15 @@ function redactCredentialText(text: string, credentialed: boolean, capped: boole
     const separator = [text.indexOf('='), text.indexOf(': ')]
       .filter((index) => index > 0)
       .reduce((first, index) => Math.min(first, index), Infinity);
-    if (separator === Infinity || !isCredentialVariable(text.slice(0, separator))) return text;
+    if (separator === Infinity) return text;
+    const name = text.slice(0, separator);
+    const valueStart = separator + (text[separator] === '=' ? 1 : 2);
+    const uriValue = redactUriVariable(name, text.slice(valueStart));
+    if (uriValue !== null) return `${text.slice(0, valueStart)}${uriValue}`;
+    if (!isCredentialVariable(name)) return text;
     return text[separator] === '='
-      ? `${text.slice(0, separator)}=${REDACTED}`
-      : `${text.slice(0, separator)}: ${REDACTED}`;
+      ? `${name}=${REDACTED}`
+      : `${name}: ${REDACTED}`;
   }
   const within = text.indexOf(FOUND_WITHIN, MATCHED_DATA.length);
   if (within === -1) {
@@ -325,11 +413,18 @@ function redactCredentialText(text: string, credentialed: boolean, capped: boole
   // came from request data, and NAME can't be told apart from it.
   if (after.includes(FOUND_WITHIN)) return text;
   const separator = after.indexOf(': ');
+  if (separator !== -1) {
+    const uriValue = redactUriVariable(after.slice(0, separator), after.slice(separator + 2));
+    if (uriValue !== null) {
+      return `${text.slice(0, within + FOUND_WITHIN.length)}${after.slice(0, separator + 2)}${uriValue}`;
+    }
+  }
   const credential = separator === -1
     // NAME ends the text: the logdata stops there, or the cap cut NAME or
     // the ": " after it.
     ? isCredentialVariable(after) || isCredentialVariable(after.replace(/:$/, ''))
       || (credentialed && isCredentialVariablePrefix(after))
+      || (capped && isArgsVariablePrefix(after))
     : isCredentialVariable(after.slice(0, separator));
   if (!credential) return text;
   const name = separator === -1 ? after : `${after.slice(0, separator)}: ${REDACTED}`;
@@ -385,8 +480,9 @@ function redactMessages(messages: unknown, credentialed: boolean): void {
 }
 
 /**
- * The audit entry with credential header values — and the credential values
- * matched rules echo in their messages — replaced, for storage.
+ * The audit entry with credential header values and credential query
+ * parameters in the request URI — and the credential values matched rules
+ * echo in their messages — replaced, for storage.
  */
 export function redactAuditEntry(entry: unknown): unknown {
   if (!entry || typeof entry !== 'object') return entry;
@@ -394,6 +490,10 @@ export function redactAuditEntry(entry: unknown): unknown {
   const copy = structuredClone(entry) as { transaction?: Record<string, unknown>; messages?: unknown };
   const tx = copy.transaction;
   if (tx && typeof tx === 'object') {
+    const request = tx.request as Record<string, unknown> | undefined;
+    if (request && typeof request === 'object' && typeof request.uri === 'string') {
+      request.uri = redactQueryString(request.uri);
+    }
     for (const part of ['request', 'response'] as const) {
       const section = tx[part] as Record<string, unknown> | undefined;
       if (section && typeof section === 'object' && 'headers' in section) {
@@ -467,7 +567,7 @@ export function parseLine(line: string, ruleMap: Map<string, RuleInfo>): WafEven
     client_ip: clientIp,
     country_code: lookupCountry(clientIp),
     method: req.method ?? '',
-    uri: req.uri ?? '',
+    uri: redacted.transaction?.request?.uri ?? '',
     rule_id: ruleInfo?.ruleId ?? null,
     rule_message: ruleInfo?.ruleMessage ?? null,
     severity: ruleInfo?.severity ?? null,
