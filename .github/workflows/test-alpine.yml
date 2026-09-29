@@ -1,0 +1,31 @@
+name: Test Alpine Caddy Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-caddy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build Caddy image for amd64 and arm64
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/caddy/Dockerfile
+          push: false
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            PUID=10000
+            PGID=10000
+          cache-from: type=gha,scope=alpine-caddy
+          cache-to: type=gha,mode=max,scope=alpine-caddy
