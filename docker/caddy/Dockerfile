@@ -1,43 +1,43 @@
 # syntax=docker/dockerfile:1.6@sha256:ac85f380a63b13dfcefa89046420e1781752bab202122f8f50032edf31be0021
 
 # Always run the builder on the host arch (BUILDPLATFORM) and let xcaddy
-# cross-compile Caddy for the target arch via GOOS/GOARCH. This avoids QEMU
-# emulation when producing the linux/arm64 image on an x86 GitHub runner —
-# native cross-compilation is several times faster.
+# cross-compile Caddy for the target arch via GOOS/GOARCH.
 FROM --platform=$BUILDPLATFORM golang:1.27@sha256:3680233e3204827fbdc66088528ae6d4b3d034f51d03a99d454f6de034888244 AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
 
 WORKDIR /build
+
 COPY docker/caddy/go.mod docker/caddy/go.sum docker/caddy/build.sh docker/caddy/update-compatibility-pins.sh ./
 
-# Every module version comes from go.mod. Dependabot updates that file weekly;
-# the compatibility updater derives cel-go from the pinned Caddy release, and
-# go.sum authenticates the module metadata used to resolve the build.
 RUN sh ./update-compatibility-pins.sh
+
 RUN XCADDY_VERSION="$(go list -m -f '{{.Version}}' github.com/caddyserver/xcaddy)" && \
     go install github.com/caddyserver/xcaddy/cmd/xcaddy@"${XCADDY_VERSION}"
+
 RUN sh ./build.sh
 
-FROM ubuntu:26.04@sha256:da6fc2be547864451aa253836dd926da33623312df4a9a243e35dc877c378a78
 
-# Accept build args for user/group IDs to support rootless operation
-# Using 10000 as default to avoid conflicts with system users
+# ============================================================
+# Alpine Linux 3.24.2
+# ============================================================
+
+FROM alpine:3.24.2
+
 ARG PUID=10000
 ARG PGID=10000
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Runtime dependencies
+RUN apk add --no-cache \
     ca-certificates \
     wget \
-    && rm -rf /var/lib/apt/lists/*
+    shadow
 
-# Copy caddy binary from builder
+# Copy custom Caddy binary
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy
 
-# Create caddy user and directories with configurable IDs for rootless operation
-# Remove any existing users/groups with the same UID/GID to avoid conflicts
+# Create caddy user and directories with configurable IDs
 RUN (getent group ${PGID} && groupdel $(getent group ${PGID} | cut -d: -f1) || true) && \
     (getent passwd ${PUID} && userdel $(getent passwd ${PUID} | cut -d: -f1) || true) && \
     groupadd -g ${PGID} caddy && \
@@ -50,11 +50,9 @@ COPY --chown=caddy:caddy docker/caddy/Caddyfile /etc/caddy/Caddyfile
 
 EXPOSE 80 443 2019
 
-# Set environment variables to use /data and /config like official Caddy image
 ENV XDG_CONFIG_HOME=/config
 ENV XDG_DATA_HOME=/data
 
-# Run as non-root user (fully rootless)
 USER caddy
 
 CMD ["caddy", "run", "--resume", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
